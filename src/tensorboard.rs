@@ -142,24 +142,11 @@ fn metric_event(event: &Event) -> Option<proto::Event> {
 
     let mut values = vec![
         ("train/loss", *loss),
-        ("train/learning_rate", *learning_rate),
-        ("progress/step", step as f32),
-        ("progress/positions", *total_positions as f32),
-        ("progress/session_positions", *positions as f32),
-        ("progress/superbatch", *superbatch as f32),
-        ("progress/batch", *batch as f32),
-        (
-            "progress/superbatch_fraction",
-            *batch as f32 / *batches_per_superbatch as f32,
-        ),
-        (
-            "progress/run_fraction",
-            step as f32 / (*batches_per_superbatch as f32 * *final_superbatch as f32),
-        ),
+        ("train/learning_rate", *learning_rate)
     ];
 
     if let Some(speed) = rate(*positions, *elapsed_seconds) {
-        values.push(("performance/positions_per_second", speed as f32));
+        values.push(("performance/mpos_per_second", (speed / 1_000_000.0) as f32));
     }
 
     Some(proto::Event {
@@ -222,19 +209,10 @@ mod tests {
         assert_eq!(
             values
                 .iter()
-                .find(|v| v.tag == "performance/positions_per_second")
+                .find(|v| v.tag == "performance/mpos_per_second")
                 .unwrap()
                 .simple_value,
-            500.0
-        );
-
-        assert_eq!(
-            values
-                .iter()
-                .find(|v| v.tag == "progress/positions")
-                .unwrap()
-                .simple_value,
-            21000.0
+            0.0005
         );
 
         assert!(metric_event(&Event::Finished).is_none());
