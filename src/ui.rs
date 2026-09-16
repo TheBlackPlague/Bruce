@@ -11,7 +11,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use std::any::Any;
 use crate::{
     events::{EVENT_PREFIX, Event},
     progress::{ProgressState, clean},
@@ -294,6 +293,10 @@ impl Display {
         if let Some(message) = self.state.update(&event) {
             if !matches!(event, Event::Metric { .. }) && (self.plain || !progress_event) {
                 self.message(&message)?;
+
+                if matches!(event, Event::Note { .. }) {
+                    self.message("")?;
+                }
             }
         }
 
