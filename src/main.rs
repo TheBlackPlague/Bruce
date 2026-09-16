@@ -10,6 +10,7 @@ use bruce::{
     convert::{self, ConvertOptions},
     data,
     events::{Event, Reporter},
+    tensorboard::TensorBoard,
     training, ui,
 };
 use clap::{Args, Parser, Subcommand};
@@ -22,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
     styles = cli_styles()
 )]
 struct Cli {
+    /// Disable live line updates (also automatic for redirected output and CI).
     #[arg(long, global = true)]
     plain: bool,
 
@@ -58,6 +60,9 @@ struct TrainOptions {
 
     #[arg(long)]
     resume: Option<PathBuf>,
+
+    #[arg(long, default_value = "runs")]
+    tensorboard_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -124,18 +129,47 @@ fn execute(cli: Cli) -> Result<()> {
         };
     }
 
-    let log_directory = match &cli.command {
-        Command::Train(options) => Config::load(&options.config)?.output_directory,
-        _ => std::env::current_dir()?.join("logs"),
+    let training_config = match &cli.command {
+        Command::Train(options) => Some(Config::load(&options.config)?),
+        _ => None,
     };
 
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let log_path = log_directory.join(format!("bruce-{stamp}.log"));
+    let heading = match &cli.command {
+        Command::Train  (   _   ) => format!("Training {}", training_config.as_ref().unwrap().name),
+        Command::Check  (   _   ) => "Checking configuration and datasets".into(),
+        Command::Convert(options) => format!(
+            "Converting {} → {:?}\nInput:  {}\nOutput: {}",
+            options.from.label(),
+            options.to,
+            options.input.display(),
+            options.output.display()
+        ),
+
+        Command::Worker { .. } => unreachable!(),
+    };
+
+    let tensorboard = match &cli.command {
+        Command::Train(options) => Some(TensorBoard::start(
+            &options.tensorboard_dir,
+            &training_config.as_ref().unwrap().name,
+        )?),
+        _ => None,
+    };
+
+    let log_name = match &training_config {
+        Some(config) => format!("{}.log", config.name),
+        None => {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            format!("bruce-{stamp}.log")
+        }
+    };
+
+    let log_path = std::env::current_dir()?.join("logs").join(log_name);
 
     let mut child = ProcessCommand::new(
         std::env::current_exe().context("Locating Bruce executable")?
     );
     child.arg("__worker").args(std::env::args_os().skip(1));
 
-    ui::run_child(child, cli.plain, &log_path)
+    ui::run_child(child, cli.plain, &log_path, &heading, tensorboard)
 }

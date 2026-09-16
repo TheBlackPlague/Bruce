@@ -21,6 +21,24 @@ pub enum DataFormat {
     Cudad,
 }
 
+impl DataFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bullet => "Bullet",
+            Self::Monty  => "Monty binpack",
+            Self::Sf     => "Stockfish binpack",
+            Self::Viri   => "Viri binpack",
+            Self::Text   => "Text",
+            Self::Marlin => "Marlin",
+            Self::Cudad  => "CudAD",
+        }
+    }
+}
+
+fn  buffer_default() -> usize { 256 }
+fn threads_default() -> usize {  2  }
+fn mapping_default() -> u8    {  2  }
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
@@ -35,10 +53,6 @@ pub struct DataConfig {
     #[serde(default)]
     pub filter: Option<FilterConfig>,
 }
-
-fn  buffer_default() -> usize { 256 }
-fn threads_default() -> usize {  2  }
-fn mapping_default() -> u8    {  2  }
 
 impl DataConfig {
     pub fn validate(&self) -> Result<()> {

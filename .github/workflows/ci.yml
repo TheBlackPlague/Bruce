@@ -27,8 +27,19 @@ jobs:
           components: clippy
       - name: Check lints without a GPU backend
         run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-      - name: Test formats, checkpoints, schedules and UI
+      - name: Test formats, checkpoints, schedules and CLI
         run: cargo test --locked --no-default-features
+      - name: Build optimized portable CLI
+        run: cargo build --release --locked --no-default-features
+      - name: Verify terminal resizing and interruption
+        if: runner.os == 'Linux'
+        run: python3 tests/terminal_progress.py target/release/bruce
+      - name: Install TensorBoard compatibility reader
+        if: runner.os == 'Linux'
+        run: python3 -m pip install 'tensorboard==2.20.0'
+      - name: Verify live and partial events with TensorBoard
+        if: runner.os == 'Linux'
+        run: cargo test --locked --no-default-features --test tensorboard -- --ignored
       - name: Fetch pinned MantaRay reference headers
         if: runner.os == 'Linux'
         uses: actions/checkout@v4

@@ -10,7 +10,7 @@
 
 * 🧠 High-Level Neural Network Training
 * 🚀 GPU Accelerated
-* 📊 Live Training Visualization
+* 📊 TensorBoard Graphs
 * 💾 Reliable Checkpointing and Resume
 * 🔄 Multiple Dataset Formats
 * ⚙️ Simple TOML Configuration

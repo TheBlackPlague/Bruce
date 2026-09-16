@@ -108,4 +108,5 @@ rustc-ice-*.txt
 /data/
 /checkpoints/
 /logs/
+/runs/
 *.nnue

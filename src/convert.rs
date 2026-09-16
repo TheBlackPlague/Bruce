@@ -65,18 +65,36 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
     let temporary =
         tempfile::NamedTempFile::new_in(parent).context("create temporary conversion output")?;
 
-    reporter.emit(Event::Phase {
+    reporter.emit(Event::DataProgress {
         name: "Converting dataset".into(),
-        completed: 0,
+        bytes: 0,
         total: Some(total),
+        positions: 0,
+        skipped: 0,
     });
 
-    let progress = phase_progress(reporter, "Converting dataset", Some(total));
+    let positions = Cell::new(     0u64     );
+    let skipped   = Cell::new(     0u64     );
+    let last      = Cell::new(Instant::now());
+
+    let progress = |bytes| {
+        if last.get().elapsed() >= Duration::from_millis(200) || bytes == total {
+            reporter.emit(Event::DataProgress {
+                name: "Converting dataset".into(),
+                bytes,
+                total: Some(total),
+                positions: positions.get(),
+                skipped: skipped.get(),
+            });
+
+            last.set(Instant::now());
+        }
+    };
 
     if options.from == DataFormat::Sf {
         reporter.emit(Event::Note {
             message: "SF VALUE_NONE (32002) and unrepresentable -32768 scores are omitted because \
-                      they are not usable evaluation targets.".into()
+                      they are not usable evaluation targets.".into(),
         });
     }
 
@@ -155,7 +173,7 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
             _ => {
                 let mut writer = BufWriter::new(File::create(temporary.path())?);
                 let mut buffer = Vec::with_capacity(8192);
-                finite::visit(
+                finite::visit_observed(
                     &options.input,
                     options.from,
                     None,
@@ -168,7 +186,12 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                         }
                         Ok(false)
                     },
-                    &progress,
+                    |bytes, written, omitted| {
+                        positions.set(written);
+                        skipped  .set(omitted);
+
+                        progress(bytes);
+                    },
                 )?;
                 ChessBoard::write_to_bin(&mut writer, &buffer)?;
                 writer.flush()?;
@@ -183,8 +206,10 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                     let mut reader = BufReader::new(File::open(&options.input)?);
 
                     while !reader.fill_buf()?.is_empty() {
-                        Game::deserialise_from(&mut reader, Vec::new())?
-                            .serialise_into(&mut writer)?;
+                        let game = Game::deserialise_from(&mut reader, Vec::new())?;
+
+                        positions.set(positions.get() + game.moves.len() as u64);
+                        game.serialise_into(&mut writer)?;
 
                         progress(reader.stream_position()?);
                     }
@@ -199,6 +224,8 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                         let mut game = Game::new(&board);
 
                         game.set_outcome(outcome(source.result)?);
+
+                        positions.set(positions.get() + source.moves.len() as u64);
 
                         for entry in source.moves {
                             let mov = board.parse_uci(&entry.best_move.to_uci(&source.castling))?;
@@ -231,7 +258,16 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                     let mut count = 0;
                     while reader.has_next() {
                         let entry = reader.next();
+
+                        count += 1;
+
                         if !finite::valid_sf_score(entry.score) {
+                            skipped.set(skipped.get() + 1);
+
+                            if count % 8192 == 0 {
+                                progress(reader.read_bytes());
+                            }
+
                             continue;
                         }
 
@@ -254,7 +290,7 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                         game.add_move(mov, score);
                         game.serialise_into(&mut writer)?;
 
-                        count += 1;
+                        positions.set(positions.get() + 1);
 
                         if count % 8192 == 0 {
                             progress(reader.read_bytes());
@@ -301,8 +337,10 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                             .legal_moves()
                             .into_iter()
                             .next()
-                            .context("terminal position cannot be represented as a scored Viri \
-                                      move; use Bullet output")?;
+                            .context(
+                                "terminal position cannot be represented as a scored Viri move; \
+                                 use Bullet output"
+                            )?;
 
                         let mut game = Game::new(&board);
 
@@ -310,8 +348,9 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                         game.add_move(mov, score);
                         game.serialise_into(&mut writer)?;
 
-                        bytes += line.len() as u64;
+                        positions.set(positions.get() + 1);
 
+                        bytes += line.len() as u64;
                         progress(bytes);
 
                         line.clear();
@@ -329,7 +368,7 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                                   and cause an explicit error.".into()
                     });
 
-                    finite::visit(
+                    finite::visit_observed(
                         &options.input,
                         options.from,
                         None,
@@ -337,7 +376,12 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                             position_game(board)?.serialise_into(&mut writer)?;
                             Ok(false)
                         },
-                        &progress,
+                        |bytes, written, omitted| {
+                            positions.set(written);
+                            skipped  .set(omitted);
+
+                            progress(bytes);
+                        },
                     )?;
                 }
             }
@@ -351,7 +395,19 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
         .persist_noclobber(&options.output)
         .map_err(|e| anyhow!("publish conversion: {e}"))?;
 
-    progress(total);
+    if matches!(options.to, OutputFormat::Bullet) {
+        positions.set(fs::metadata(&options.output)?.len() / size_of::<ChessBoard>() as u64);
+    }
+
+    if !matches!(
+        (options.from, options.to),
+        (
+            DataFormat::Bullet | DataFormat::Marlin | DataFormat::Cudad | DataFormat::Text,
+            OutputFormat::Bullet
+        )
+    ) {
+        progress(total);
+    }
 
     reporter.emit(Event::Note {
         message: format!("Saved {}", options.output.display()),
@@ -368,10 +424,12 @@ fn observe_native_output(
     reporter: &Reporter,
     convert: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    reporter.emit(Event::Phase {
-        name: "Writing converted data".into(),
-        completed: 0,
+    reporter.emit(Event::DataProgress {
+        name: "Writing converted data (output bytes)".into(),
+        bytes: 0,
         total,
+        positions: 0,
+        skipped: 0,
     });
 
     std::thread::scope(|scope| {
@@ -388,11 +446,14 @@ fn observe_native_output(
                 let completed = fs::metadata(output).map_or(previous, |metadata| metadata.len());
 
                 if completed != previous || finished {
-                    reporter.emit(Event::Phase {
-                        name: "Writing converted data".into(),
-                        completed,
+                    reporter.emit(Event::DataProgress {
+                        name: "Writing converted data (output bytes)".into(),
+                        bytes: completed,
                         total,
+                        positions: completed / size_of::<ChessBoard>() as u64,
+                        skipped: 0,
                     });
+
                     previous = completed;
                 }
 
@@ -504,7 +565,7 @@ fn position_game(record: ChessBoard) -> Result<Game> {
         .next()
         .context(
             "terminal position has no legal move: \
-            use Bullet output, since Viri stores scores on moves"
+             use Bullet output, since Viri stores scores on moves"
         )?;
 
     let mut game = Game::new(&board);
@@ -557,7 +618,7 @@ mod tests {
         );
     }
 
-    fn collected(path: &std::path::Path, format: DataFormat) -> Vec<ChessBoard> {
+    fn collected(path: &Path, format: DataFormat) -> Vec<ChessBoard> {
         let mut records = Vec::new();
         finite::visit(
             path,

@@ -12,6 +12,15 @@ pub enum Event {
         completed: u64,
         total: Option<u64>,
     },
+
+    DataProgress {
+        name: String,
+        bytes: u64,
+        total: Option<u64>,
+        positions: u64,
+        skipped: u64,
+    },
+
     Metric {
         superbatch: usize,
         batch: usize,
@@ -20,13 +29,18 @@ pub enum Event {
         loss: f32,
         learning_rate: f32,
         positions: u64,
+        total_positions: u64,
+        elapsed_seconds: f64,
     },
+
     Checkpoint {
         path: PathBuf,
     },
+
     Note {
         message: String,
     },
+    
     Finished,
 }
 

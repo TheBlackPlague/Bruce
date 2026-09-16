@@ -87,8 +87,43 @@ pub fn visit(
     path: &Path,
     format: DataFormat,
     filter: Option<&FilterConfig>,
+    callback: impl FnMut(ChessBoard) -> Result<bool>,
+    progress: impl FnMut(u64),
+) -> Result<()> {
+    visit_inner(path, format, filter, callback, progress, || {})
+}
+
+pub fn visit_observed(
+    path: &Path,
+    format: DataFormat,
+    filter: Option<&FilterConfig>,
     mut callback: impl FnMut(ChessBoard) -> Result<bool>,
-    mut progress: impl FnMut(u64),
+    mut progress: impl FnMut(u64, u64, u64),
+) -> Result<()> {
+    let positions = std::cell::Cell::new(0u64);
+    let skipped   = std::cell::Cell::new(0u64);
+
+    visit_inner(
+        path,
+        format,
+        filter,
+        |board| {
+            let stop = callback(board)?;
+            positions.set(positions.get() + 1);
+            Ok(stop)
+        },
+        |bytes| progress(bytes, positions.get(), skipped.get()),
+        || skipped.set(skipped.get() + 1),
+    )
+}
+
+fn visit_inner(
+    path: &Path,
+    format: DataFormat,
+    filter: Option<&FilterConfig>,
+    mut callback: impl FnMut(ChessBoard) -> Result<bool>,
+    mut progress: impl FnMut(    u64   ),
+    mut  skipped: impl FnMut(          ),
 ) -> Result<()> {
     match format {
         DataFormat::Bullet => fixed::< ChessBoard >(path, &mut callback, &mut progress),
@@ -168,6 +203,11 @@ pub fn visit(
             let mut count = 0;
             while reader.has_next() {
                 let entry = reader.next();
+
+                if !valid_sf_score(entry.score) {
+                    skipped();
+                }
+
                 if valid_sf_score(entry.score)
                     && filter.is_none_or(|filter| filter.sf(&entry))
                     && callback(sf_board(&entry)?)?
@@ -265,4 +305,18 @@ fn fixed<T>(
     });
 
     result
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn unusable_sf_score_policy_is_unchanged() {
+        assert!(!valid_sf_score( 32002));
+        assert!( valid_sf_score(-32002));
+
+        assert!(!valid_sf_score(i16::MIN));
+        assert!( valid_sf_score(i16::MAX));
+    }
 }
