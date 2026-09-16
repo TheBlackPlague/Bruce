@@ -118,6 +118,8 @@ pub fn run_child(
     let mut display = Display::new(plain);
     display.message(&format!("🦈 Bruce {}", env!("CARGO_PKG_VERSION")))?;
 
+    display.message("")?;
+
     for line in heading.lines() {
         display.message(line)?;
     }
@@ -125,6 +127,8 @@ pub fn run_child(
     if let Some(logger) = &tensorboard {
         display.message(&format!("TensorBoard: {}", logger.directory.display()))?;
     }
+
+    display.message("")?;
 
     let result = monitor(
         &mut child.0,
@@ -228,6 +232,8 @@ struct Display {
     last_plain: Instant,
     checkpoint: Option<String>,
     training_summary: Option<String>,
+    completed_superbatch: Option<usize>,
+    between_superbatches: bool,
 }
 
 impl Display {
@@ -241,6 +247,8 @@ impl Display {
             },
         );
 
+        bar.set_style(ProgressStyle::with_template("").expect("empty progress template"));
+
         Self {
             bar,
             plain,
@@ -248,6 +256,8 @@ impl Display {
             last_plain: Instant::now(),
             checkpoint: None,
             training_summary: None,
+            completed_superbatch: None,
+            between_superbatches: false,
         }
     }
 
@@ -257,7 +267,7 @@ impl Display {
         if self.plain || self.bar.is_hidden() {
             writeln!(io::stderr().lock(), "{message}")
         } else {
-            self.bar.println(message);
+            self.bar.println(if message.is_empty() { " " } else { &message });
 
             Ok(())
         }
@@ -272,8 +282,33 @@ impl Display {
             self.checkpoint = Some(clean(&path.display().to_string()));
         }
 
+        let progress_event = matches!(event,
+            Event::Phase { .. } | Event::DataProgress { .. } | Event::Metric { .. }
+        );
+
+        if self.between_superbatches && progress_event {
+            self.bar.reset();
+            self.between_superbatches = false;
+        }
+
         if let Some(message) = self.state.update(&event) {
-            self.message(&message)?;
+            if !matches!(event, Event::Metric { .. }) && (self.plain || !progress_event) {
+                self.message(&message)?;
+            }
+        }
+
+        if  let Event::Metric { superbatch, batch, batches_per_superbatch, .. } = &event &&
+            *batches_per_superbatch > 0                                                  &&
+            batch == batches_per_superbatch
+        {
+            self.bar.finish_and_clear();
+            self.between_superbatches = true;
+
+            if self.completed_superbatch != Some(*superbatch) {
+                self.message(&format!("{} · COMPLETED", self.state.name))?;
+
+                self.completed_superbatch = Some(*superbatch);
+            }
         }
 
         if matches!(event, Event::Metric { .. }) {
@@ -284,6 +319,10 @@ impl Display {
     }
 
     fn refresh(&mut self, force: bool) -> Result<()> {
+        if self.between_superbatches {
+            return Ok(());
+        }
+
         if self.plain {
             if force || self.last_plain.elapsed() >= PLAIN_INTERVAL {
                 self.message(&self.state.summary())?;
@@ -291,7 +330,7 @@ impl Display {
             }
         } else {
             let template = if self.state.total.is_some() {
-                "{prefix} {wide_bar:.cyan} {percent:>5.1}%\n{wide_msg}"
+                "{prefix} {wide_bar:.#55dc85/#adb0b2} {percent:>5.1}%\n{wide_msg}"
             } else {
                 "{spinner:.cyan} {prefix}\n{wide_msg}"
             };
@@ -299,7 +338,7 @@ impl Display {
             self.bar.set_style(ProgressStyle::with_template(template)?.progress_chars("━╸─"));
 
             self.bar.set_prefix(if self.state.total.is_some() {
-                self.state.count()
+                format!("{} · {}", self.state.name, self.state.count())
             } else {
                 self.state.name.clone()
             });
@@ -316,6 +355,7 @@ impl Display {
     fn finish(&mut self, success: bool) -> Result<()> {
         self.bar.finish_and_clear();
 
+        self.message("")?;
         self.message(self.training_summary.as_deref().unwrap_or(&self.state.summary()))?;
 
         self.message(if success {
@@ -331,5 +371,64 @@ impl Display {
 impl Drop for Display {
     fn drop(&mut self) {
         self.bar.finish_and_clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metric(superbatch: usize, batch: usize) -> Event {
+        Event::Metric {
+            superbatch,
+            batch,
+            batches_per_superbatch: 10,
+            final_superbatch: 3,
+            loss: 0.1,
+            learning_rate: 0.001,
+            positions: 100,
+            total_positions: 100,
+            elapsed_seconds: 1.0,
+        }
+    }
+
+    #[test]
+    fn completion_requires_final_batch_and_survives_checkpoint_phases() {
+        let mut display = Display::new(true);
+        let mut logger = None;
+
+        display.event(metric(1, 9), &mut logger).unwrap();
+        assert_eq!(display.completed_superbatch, None);
+
+        display.event(metric(1, 10), &mut logger).unwrap();
+        assert_eq!(display.completed_superbatch, Some(1));
+
+        assert!(display.between_superbatches);
+        assert!(display.bar.is_finished());
+
+        display.event(Event::Phase {
+            name: "Saving checkpoint".into(), completed: 0, total: None,
+        }, &mut logger).unwrap();
+
+        assert!(!display.between_superbatches);
+        assert!(!display.bar.is_finished());
+
+        display.event(metric(2, 1), &mut logger).unwrap();
+        assert_eq!(display.completed_superbatch, Some(1));
+
+        display.finish(false).unwrap();
+        assert_eq!(display.completed_superbatch, Some(1));
+    }
+
+    #[test]
+    fn final_superbatch_is_completed_without_a_following_superbatch() {
+        let mut display = Display::new(true);
+        let mut logger = None;
+
+        display.event(metric(3, 10), &mut logger).unwrap();
+        display.event(Event::Finished, &mut logger).unwrap();
+
+        assert_eq!(display.completed_superbatch, Some(3));
+        assert!(display.between_superbatches);
     }
 }

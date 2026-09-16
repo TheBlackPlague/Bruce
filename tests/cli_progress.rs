@@ -42,7 +42,8 @@ fn redirected_and_explicit_plain_preserve_summary_and_no_ansi() {
         let text = String::from_utf8(output.stderr).unwrap();
 
         assert!(output.status.success(), "{text}");
-        assert!(text.contains("Converting Text → Bullet"), "{text}");
+        assert!(text.contains("\n\nConverting Text → Bullet"), "{text}");
+        assert!(text.contains("output.bullet\n\n"), "{text}");
         assert!(text.contains("1 pos · skipped 0"), "{text}");
         assert!(
             text.contains("100.0%") && text.contains("Complete."),
