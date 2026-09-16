@@ -1,0 +1,48 @@
+schema_version = 1
+
+name = "aurora-bt4-v2-000"
+architecture = "Aurora"
+
+output_directory = "../checkpoints"
+
+seed = 42
+device = 0
+
+[training]
+batch_size = 16384
+batches_per_superbatch = 6104
+superbatches = 240
+save_every = 60
+log_every = 32
+
+[data]
+format = "sf"
+paths = [
+    "/mnt/d/HFData/Monty-BT4-SF-v8-dd-v0-data.binpack"
+]
+buffer_size_mb = 8192
+loader_threads = 8
+mapping_threads = 4
+
+[data.filter]
+min_ply = 14
+max_eval = 8000
+exclude_tactical = true
+exclude_check = true
+
+[optimizer]
+decay = 0.01
+beta1 = 0.9
+beta2 = 0.999
+min_weight = -1.98
+max_weight = 1.98
+
+[learning_rate]
+kind = "step"
+start = 0.001
+gamma = 0.3
+step = 60
+
+[wdl]
+kind = "constant"
+value = 0.0

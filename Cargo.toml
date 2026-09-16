@@ -1,0 +1,34 @@
+[package]
+name = "bruce"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Neural Network Trainer Interface for StockDory"
+repository = "https://github.com/TheBlackPlague/Bruce"
+
+[features]
+default = ["cuda"]
+cuda = ["bullet_lib/cuda", "bullet-trainer/cuda", "bullet-gpu/cuda"]
+rocm = ["bullet_lib/rocm", "bullet-trainer/rocm", "bullet-gpu/rocm"]
+metal = ["bullet_lib/metal", "bullet-trainer/metal", "bullet-gpu/metal"]
+
+[dependencies]
+anyhow = "1"
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
+bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
+bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
+bulletformat = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+ctrlc = "3.4"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
