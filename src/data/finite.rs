@@ -59,71 +59,41 @@ pub fn validate_board(board: &ChessBoard) -> Result<()> {
 }
 
 pub fn sf_board(entry: &TrainingDataEntry) -> Result<ChessBoard> {
-    let black = entry.pos.side_to_move().ordinal() != 0;
+    let mut board = ChessBoard::from_raw(
+        sf_bitboards(entry),
+        usize::from(entry.pos.side_to_move().ordinal()),
+        0,
+        0.5,
+    ).map_err(|e| anyhow!(e))?;
 
-    let score = if black {
-        -i32::from(entry.score)
-    } else {
-        i32::from(entry.score)
-    };
+    board.score = entry.score;
+    board.result = (1 + entry.result) as u8;
 
-    let result = if black {
-        1 - entry.result
-    } else {
-        1 + entry.result
-    };
+    Ok(board)
+}
 
-    let text = format!(
-        "{} | {} | {}",
-        entry.pos.fen().map_err(|e| anyhow!("{e:?}"))?,
-        score,
-        f32::from(result) / 2.0
-    );
+pub fn sf_bitboards(entry: &TrainingDataEntry) -> [u64; 8] {
+    use bullet_lib::game::formats::sfbinpack::chess::{color::Color, piecetype::PieceType};
+    let pos = &entry.pos;
+    [
+        pos.pieces_bb(Color::White).bits(),
+        pos.pieces_bb(Color::Black).bits(),
 
-    text.parse().map_err(|e: String| anyhow!(e))
+        pos.pieces_bb_type(PieceType::Pawn  ).bits(),
+        pos.pieces_bb_type(PieceType::Knight).bits(),
+        pos.pieces_bb_type(PieceType::Bishop).bits(),
+        pos.pieces_bb_type(PieceType::Rook  ).bits(),
+        pos.pieces_bb_type(PieceType::Queen ).bits(),
+        pos.pieces_bb_type(PieceType::King  ).bits(),
+    ]
 }
 
 pub fn visit(
     path: &Path,
     format: DataFormat,
     filter: Option<&FilterConfig>,
-    callback: impl FnMut(ChessBoard) -> Result<bool>,
-    progress: impl FnMut(u64),
-) -> Result<()> {
-    visit_inner(path, format, filter, callback, progress, || {})
-}
-
-pub fn visit_observed(
-    path: &Path,
-    format: DataFormat,
-    filter: Option<&FilterConfig>,
     mut callback: impl FnMut(ChessBoard) -> Result<bool>,
-    mut progress: impl FnMut(u64, u64, u64),
-) -> Result<()> {
-    let positions = std::cell::Cell::new(0u64);
-    let skipped   = std::cell::Cell::new(0u64);
-
-    visit_inner(
-        path,
-        format,
-        filter,
-        |board| {
-            let stop = callback(board)?;
-            positions.set(positions.get() + 1);
-            Ok(stop)
-        },
-        |bytes| progress(bytes, positions.get(), skipped.get()),
-        || skipped.set(skipped.get() + 1),
-    )
-}
-
-fn visit_inner(
-    path: &Path,
-    format: DataFormat,
-    filter: Option<&FilterConfig>,
-    mut callback: impl FnMut(ChessBoard) -> Result<bool>,
-    mut progress: impl FnMut(    u64   ),
-    mut  skipped: impl FnMut(          ),
+    mut progress: impl FnMut(    u64   )                ,
 ) -> Result<()> {
     match format {
         DataFormat::Bullet => fixed::< ChessBoard >(path, &mut callback, &mut progress),
@@ -203,10 +173,6 @@ fn visit_inner(
             let mut count = 0;
             while reader.has_next() {
                 let entry = reader.next();
-
-                if !valid_sf_score(entry.score) {
-                    skipped();
-                }
 
                 if valid_sf_score(entry.score)
                     && filter.is_none_or(|filter| filter.sf(&entry))

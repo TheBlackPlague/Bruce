@@ -91,51 +91,113 @@ fn stockfish_conversion_reports_skips_and_preserves_usable_scores() {
     let directory = tempfile::tempdir().unwrap();
 
     let input = directory.path().join("input.binpack");
+    let scores = [125, 32002, 32002, -200, -32002, i16::MIN, i16::MAX];
     {
-        let file = fs::File::create(&input).unwrap();
-        let mut writer = CompressedTrainingDataEntryWriter::new(file).unwrap();
+        let mut file = fs::File::create(&input).unwrap();
+        for side in ["w", "b"] {
+            for score in scores {
+                let mut chunk = Vec::new();
+                let mut writer = CompressedTrainingDataEntryWriter::new(&mut chunk).unwrap();
 
-        for score in [125, 32002, 32002, -200] {
-            writer.write_entry(&TrainingDataEntry {
-                pos: Position::from_fen(
-                    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                ).unwrap(),
-                mv: Move::new(
-                    Square::new(12),
-                    Square::new(28),
-                    MoveType::Normal,
-                    Piece::none(),
-                ),
-                score,
-                ply: 0,
-                result: 0,
-            }).unwrap();
+                let (from, to) = if side == "w" { (12, 28) } else { (52, 36) };
+
+                writer.write_entry(&TrainingDataEntry {
+                    pos: Position::from_fen(&format!(
+                        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR {side} KQkq - 0 1"
+                    )).unwrap(),
+                    mv: Move::new(
+                        Square::new(from),
+                        Square::new( to ),
+                        MoveType::Normal,
+                        Piece::none(),
+                    ),
+                    score: if score == i16::MIN { 0 } else { score },
+                    ply: u16::from(side == "b"),
+                    result: -1,
+                }).unwrap();
+
+                drop(writer);
+
+                if score == i16::MIN {
+                    chunk[34..36].copy_from_slice(&u16::MAX.to_be_bytes());
+                }
+
+                std::io::Write::write_all(&mut file, &chunk).unwrap();
+            }
         }
     }
 
     for to in ["bullet", "viri"] {
-        let output = directory.path().join(to);
-        let result = Command::new(env!("CARGO_BIN_EXE_bruce"))
-            .current_dir(directory.path())
-            .args(["convert", "--from", "sf", "--to", to, "--input"])
-            .arg(&input)
-            .arg("--output")
-            .arg(&output)
-            .output()
-            .unwrap();
+        let mut serial = Vec::new();
 
-        let text = String::from_utf8(result.stderr).unwrap();
-        assert!(result.status.success(), "{text}");
-        assert!(text.contains("2 pos · skipped 2"), "{text}");
+        for threads in ["1", "3"] {
+            let output = directory.path().join(format!("{to}-{threads}"));
+            let result = Command::new(env!("CARGO_BIN_EXE_bruce"))
+                .current_dir(directory.path())
+                .args([
+                    "convert",
+                    "--from",
+                    "sf",
+                    "--to",
+                    to,
+                    "--threads",
+                    threads,
+                    "--input",
+                ])
+                .arg(&input)
+                .arg("--output")
+                .arg(&output)
+                .output()
+                .unwrap();
 
-        if to == "bullet" {
-            let mut scores = Vec::new();
+            let text = String::from_utf8(result.stderr).unwrap();
+            assert!(result.status.success(), "{text}");
 
-            DataLoader::<ChessBoard>::new(output, 1).unwrap().map_batches(10, |batch| {
-                scores.extend(batch.iter().map(|b| b.score()));
-            });
+            let summary = if to == "bullet" {
+                "10 pos · skipped 4"
+            } else {
+                "9 pos · skipped 5"
+            };
+            assert!(text.contains(summary), "{text}");
 
-            assert_eq!(scores, [125, -200]);
+            let bytes = fs::read(&output).unwrap();
+            if threads == "1" {
+                serial = bytes;
+            } else {
+                assert_eq!(bytes, serial);
+            }
+
+            if to == "bullet" {
+                let mut actual = Vec::new();
+                DataLoader::<ChessBoard>::new(output, 1).unwrap().map_batches(10, |batch| {
+                    actual.extend(batch.iter().map(|b| (b.score(), b.result_idx())));
+                });
+
+                let expected: Vec<_> = scores
+                    .into_iter()
+                    .filter(|s| *s != 32002)
+                    .map(|s| (s, 0))
+                    .cycle()
+                    .take(10)
+                    .collect();
+                assert_eq!(actual, expected);
+            } else {
+                use bullet_lib::game::formats::viriformat::dataformat::Game;
+
+                let mut reader = std::io::BufReader::new(fs::File::open(output).unwrap());
+
+                for black in [false, true] {
+                    for score in scores {
+                        if score == 32002 || (black && score == i16::MIN) {
+                            continue;
+                        }
+
+                        let game = Game::deserialise_from(&mut reader, Vec::new()).unwrap();
+                        assert_eq!(game.moves[0].1.get(), if black { -score } else { score });
+                        assert_eq!(game.initial_position().turn().inner(), u8::from(black));
+                    }
+                }
+            }
         }
     }
 }
