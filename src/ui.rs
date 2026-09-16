@@ -11,7 +11,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
+use std::any::Any;
 use crate::{
     events::{EVENT_PREFIX, Event},
     progress::{ProgressState, clean},
@@ -330,7 +330,7 @@ impl Display {
             }
         } else {
             let template = if self.state.total.is_some() {
-                "{prefix} {wide_bar:.#55dc85/#adb0b2} {percent:>5.1}%\n{wide_msg}"
+                "{prefix} {wide_bar:.#55dc85/#adb0b2} {percent:>5.#45caff}%\n{wide_msg}"
             } else {
                 "{spinner:.cyan} {prefix}\n{wide_msg}"
             };

@@ -13,6 +13,7 @@ pub struct ProgressState {
     started: Instant,
     elapsed: Option<f64>,
     rate: Option<f64>,
+    run_remaining: Option<u64>,
 }
 
 impl Default for ProgressState {
@@ -28,6 +29,7 @@ impl Default for ProgressState {
             started: Instant::now(),
             elapsed: None,
             rate: None,
+            run_remaining: None,
         }
     }
 }
@@ -72,7 +74,8 @@ impl ProgressState {
                 elapsed_seconds,
                 total_positions,
             } => {
-                let name = format!("Training · superbatch {superbatch}/{final_superbatch}");
+                let width = final_superbatch.to_string().len();
+                let name = format!("Training · superbatch {superbatch:>width$}/{final_superbatch}");
                 let changed = self.phase(&name, false);
                 self.completed = *batch as u64;
                 self.total = Some(*batches_per_superbatch as u64);
@@ -90,6 +93,13 @@ impl ProgressState {
                 let size = total_positions.checked_div(step).unwrap_or(0);
 
                 self.rate = throughput.filter(|_| size > 0).map(|r| r / size as f64);
+
+                self.run_remaining = final_superbatch.saturating_sub(*superbatch)
+                    .checked_mul(*batches_per_superbatch)
+                    .and_then(|remaining| remaining.checked_add(
+                        batches_per_superbatch.saturating_sub(*batch)
+                    ))
+                    .map(|remaining| remaining as u64);
 
                 changed.then_some(name)
             }
@@ -146,8 +156,18 @@ impl ProgressState {
 
     pub fn live_message(&self) -> String {
         let elapsed = self.elapsed();
-        let speed = self.rate.or_else(|| rate(self.completed, elapsed));
-        let eta = eta(self.completed, self.total, speed).map_or_else(|| "--:--".into(), duration);
+
+        let speed = if self.run_remaining.is_some() {
+            self.rate
+        } else {
+            self.rate.or_else(|| rate(self.completed, elapsed))
+        };
+
+        let batch_eta = eta(
+            self.completed,
+            self.total,
+            speed
+        ).map_or_else(|| "--:--".into(), duration);
 
         let metrics = if self.bytes {
             format!(
@@ -160,10 +180,19 @@ impl ProgressState {
             self.detail.clone()
         };
 
-        let timing = format!(
-            "time {} · ETA {eta}",
+        let mut timing = format!(
+            "time {} · ETA {batch_eta}",
             duration(Duration::from_secs_f64(elapsed.max(0.0)))
         );
+
+        if let Some(remaining) = self.run_remaining {
+            let total_eta = eta(
+                0,
+                Some(remaining),
+                self.rate
+            ).map_or_else(|| "--:--".into(), duration);
+            timing.push_str(&format!(" · Total ETA {total_eta}"));
+        }
 
         if metrics.is_empty() {
             timing
@@ -314,7 +343,7 @@ mod tests {
         assert_eq!(state.rate      , Some(5.0));
         assert_eq!(state.fraction(), Some(0.1));
 
-        assert!(state.summary().contains("ETA 00:00:18"));
+        assert!(state.summary().contains("ETA 00:00:18 · Total ETA 00:00:58"));
 
         state.update(&Event::Phase {
             name: "Saving checkpoint".into(),
@@ -323,7 +352,30 @@ mod tests {
         });
 
         assert_eq!(state.rate, None);
+        assert!(!state.live_message().contains("Total ETA"));
         assert!(state.detail.is_empty());
+    }
+
+    #[test]
+    fn superbatch_alignment_and_run_eta_boundaries() {
+        let mut state = ProgressState::default();
+
+        for (superbatch, batch, positions, elapsed, expected_name, expected_eta) in [
+            (  8,  50, 1000, 2.0, "Training · superbatch   8/240", "Total ETA 01:17:30"),
+            (  9, 100, 1000, 2.0, "Training · superbatch   9/240", "Total ETA 01:17:00"),
+            ( 10,  50,    0, 0.0, "Training · superbatch  10/240", "Total ETA --:--"   ),
+            (240, 100, 1000, 2.0, "Training · superbatch 240/240", "Total ETA 00:00:00"),
+        ] {
+            state.update(&Event::Metric {
+                superbatch, batch, batches_per_superbatch: 100, final_superbatch: 240,
+                loss: 0.1, learning_rate: 0.001, positions,
+                total_positions: ((superbatch - 1) * 100 + batch) as u64 * 100,
+                elapsed_seconds: elapsed,
+            });
+
+            assert_eq!(state.name, expected_name);
+            assert!(state.live_message().contains(expected_eta), "{}", state.live_message());
+        }
     }
 
     #[test]
