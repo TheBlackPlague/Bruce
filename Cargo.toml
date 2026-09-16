@@ -19,9 +19,10 @@ bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e5
 bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
 bulletformat = "1.8"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
+indicatif = "0.18"
+prost = "0.14"
+crc32c = "0.6"
 ctrlc = "3.4"
-ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

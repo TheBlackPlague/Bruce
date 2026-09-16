@@ -10,6 +10,7 @@ use bruce::{
     convert::{self, ConvertOptions},
     data,
     events::{Event, Reporter},
+    tensorboard::TensorBoard,
     training, ui,
 };
 use clap::{Args, Parser, Subcommand};
@@ -22,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
     styles = cli_styles()
 )]
 struct Cli {
+    /// Disable live line updates (also automatic for redirected output and CI).
     #[arg(long, global = true)]
     plain: bool,
 
@@ -58,6 +60,9 @@ struct TrainOptions {
 
     #[arg(long)]
     resume: Option<PathBuf>,
+
+    #[arg(long, default_value = "runs")]
+    tensorboard_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -124,6 +129,28 @@ fn execute(cli: Cli) -> Result<()> {
         };
     }
 
+    let heading = match &cli.command {
+        Command::Train  (options) => format!("Training {}", Config::load(&options.config)?.name),
+        Command::Check  (   _   ) => "Checking configuration and datasets".into(),
+        Command::Convert(options) => format!(
+            "Converting {} → {:?}\nInput:  {}\nOutput: {}",
+            options.from.label(),
+            options.to,
+            options.input.display(),
+            options.output.display()
+        ),
+
+        Command::Worker { .. } => unreachable!(),
+    };
+
+    let tensorboard = match &cli.command {
+        Command::Train(options) => Some(TensorBoard::start(
+            &options.tensorboard_dir,
+            &Config::load(&options.config)?.name,
+        )?),
+        _ => None,
+    };
+
     let log_directory = match &cli.command {
         Command::Train(options) => Config::load(&options.config)?.output_directory,
         _ => std::env::current_dir()?.join("logs"),
@@ -137,5 +164,5 @@ fn execute(cli: Cli) -> Result<()> {
     );
     child.arg("__worker").args(std::env::args_os().skip(1));
 
-    ui::run_child(child, cli.plain, &log_path)
+    ui::run_child(child, cli.plain, &log_path, &heading, tensorboard)
 }

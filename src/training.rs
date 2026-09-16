@@ -1,6 +1,7 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -100,6 +101,8 @@ pub fn run(config: Config, resume: Option<PathBuf>, reporter: Reporter) -> Resul
         total: None,
     });
 
+    let training_started = Instant::now();
+
     let mut positions = 0_u64;
     let mut loss_sum = 0.0_f64;
     let mut loss_batches = 0_usize;
@@ -137,6 +140,10 @@ pub fn run(config: Config, resume: Option<PathBuf>, reporter: Reporter) -> Resul
                         loss: (loss_sum / loss_batches as f64) as f32,
                         learning_rate: config.learning_rate.lr(step.batch(), step.superbatch()),
                         positions,
+                        total_positions: ((step.superbatch() - 1) * step.batches_per_superbatch()
+                            + batch) as u64
+                            * config.training.batch_size as u64,
+                        elapsed_seconds: training_started.elapsed().as_secs_f64(),
                     });
 
                     loss_sum = 0.0;

@@ -1,5 +1,5 @@
 #[cfg(any(
-    all(feature = "cuda", feature = "rocm" ),
+    all(feature = "cuda", feature = "rocm"),
     all(feature = "cuda", feature = "metal"),
     all(feature = "rocm", feature = "metal")
 ))]
@@ -14,3 +14,6 @@ pub mod events;
 pub mod schedule;
 pub mod training;
 pub mod ui;
+
+pub mod progress;
+pub mod tensorboard;
