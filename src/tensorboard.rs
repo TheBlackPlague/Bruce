@@ -124,11 +124,11 @@ fn metric_event(event: &Event) -> Option<proto::Event> {
         superbatch,
         batch,
         batches_per_superbatch,
-        final_superbatch,
+        final_superbatch: _,
         loss,
         learning_rate,
         positions,
-        total_positions,
+        total_positions: _,
         elapsed_seconds,
     } = event
     else {
