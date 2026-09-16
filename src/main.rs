@@ -129,8 +129,13 @@ fn execute(cli: Cli) -> Result<()> {
         };
     }
 
+    let training_config = match &cli.command {
+        Command::Train(options) => Some(Config::load(&options.config)?),
+        _ => None,
+    };
+
     let heading = match &cli.command {
-        Command::Train  (options) => format!("Training {}", Config::load(&options.config)?.name),
+        Command::Train  (   _   ) => format!("Training {}", training_config.as_ref().unwrap().name),
         Command::Check  (   _   ) => "Checking configuration and datasets".into(),
         Command::Convert(options) => format!(
             "Converting {} → {:?}\nInput:  {}\nOutput: {}",
@@ -146,18 +151,18 @@ fn execute(cli: Cli) -> Result<()> {
     let tensorboard = match &cli.command {
         Command::Train(options) => Some(TensorBoard::start(
             &options.tensorboard_dir,
-            &Config::load(&options.config)?.name,
+            &training_config.as_ref().unwrap().name,
         )?),
         _ => None,
     };
 
-    let log_directory = match &cli.command {
-        Command::Train(options) => Config::load(&options.config)?.output_directory,
-        _ => std::env::current_dir()?.join("logs"),
+    let log_path = match &training_config {
+        Some(config) => config.output_directory.join(format!("{}.log", config.name)),
+        None => {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            std::env::current_dir()?.join("logs").join(format!("bruce-{stamp}.log"))
+        }
     };
-
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let log_path = log_directory.join(format!("bruce-{stamp}.log"));
 
     let mut child = ProcessCommand::new(
         std::env::current_exe().context("Locating Bruce executable")?

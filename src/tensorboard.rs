@@ -31,12 +31,13 @@ impl TensorBoard {
         );
 
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let directory = root.join(name).join(format!("{stamp}-{}", std::process::id()));
+        let directory = root.join(name);
 
-        fs::create_dir_all(directory.parent().context("run parent")?)?;
-        fs::create_dir(&directory).context("create TensorBoard attempt")?;
+        fs::create_dir_all(&directory).context("create TensorBoard run directory")?;
 
-        let file = File::create_new(directory.join(format!("events.out.tfevents.{stamp}.bruce")))?;
+        let file = File::create_new(
+            directory.join(format!("events.out.tfevents.{stamp}.{}.bruce", std::process::id()))
+        )?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
         write_record(
@@ -187,6 +188,7 @@ fn write_record(writer: &mut impl Write, event: &proto::Event) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn metric() -> Event {
         Event::Metric {
             superbatch: 3,
@@ -200,6 +202,7 @@ mod tests {
             elapsed_seconds: 2.0,
         }
     }
+
     #[test]
     fn resumed_step_and_session_rate_are_not_confused() {
         let event = metric_event(&metric()).unwrap();
@@ -217,8 +220,8 @@ mod tests {
 
         assert!(metric_event(&Event::Finished).is_none());
     }
-    fn records(directory: &Path) -> Vec<proto::Event> {
-        let file = fs::read_dir(directory).unwrap().next().unwrap().unwrap().path();
+
+    fn records(file: &Path) -> Vec<proto::Event> {
         let bytes = fs::read(file).unwrap();
 
         let mut offset = 0;
@@ -245,8 +248,9 @@ mod tests {
         }
         events
     }
+
     #[test]
-    fn finalization_and_partial_runs_are_readable_and_distinct() {
+    fn repeated_sessions_share_directory_and_preserve_readable_files() {
         let root = tempfile::tempdir().unwrap();
         let mut logger = TensorBoard::start(root.path(), "test-run").unwrap();
         let first = logger.directory.clone();
@@ -255,7 +259,10 @@ mod tests {
         assert_eq!(logger.finish().unwrap(), 0);
         assert_eq!(logger.finish().unwrap(), 0);
 
-        let events = records(&first);
+        assert_eq!(first, root.path().join("test-run"));
+
+        let first_file = fs::read_dir(&first).unwrap().next().unwrap().unwrap().path();
+        let events = records(&first_file);
 
         assert_eq!(events[0].file_version.as_deref(), Some("brain.Event:2"));
         assert_eq!(events[1].step, 210);
@@ -267,10 +274,21 @@ mod tests {
             logger.observe(&metric());
         }
 
-        assert_ne!(first, second);
-        assert_eq!(records(&second).len(), 2);
+        assert_eq!(first, second);
+
+        let files: Vec<_> = fs::read_dir(&second).unwrap().map(|f| f.unwrap().path()).collect();
+        assert_eq!(files.len(), 2);
+
+        for file in files {
+            assert!(file.is_file());
+            let events = records(&file);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].file_version.as_deref(), Some("brain.Event:2"));
+            assert_eq!(events[1].step, 210);
+        }
         assert!(TensorBoard::start(root.path(), "../escape").is_err());
     }
+
     #[test]
     fn saturated_and_failed_writers_never_block_submission() {
         let (sender, _receiver) = mpsc::sync_channel(1);

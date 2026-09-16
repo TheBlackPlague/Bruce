@@ -22,13 +22,14 @@ fn official_tensorboard_reads_live_final_and_partial_runs() {
 
     std::thread::sleep(std::time::Duration::from_millis(5200));
 
-    let verify = |path: &std::path::Path| {
+    let verify = |path: &std::path::Path, count: &str| {
         let result = std::process::Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/verify_tensorboard.py"
             ))
             .arg(path)
+            .arg(count)
             .output()
             .unwrap();
 
@@ -39,9 +40,9 @@ fn official_tensorboard_reads_live_final_and_partial_runs() {
         );
     };
 
-    verify(&logger.directory);
+    verify(&logger.directory, "1");
     logger.finish().unwrap();
-    verify(&logger.directory);
+    verify(&logger.directory, "1");
 
     let path;
     {
@@ -50,5 +51,7 @@ fn official_tensorboard_reads_live_final_and_partial_runs() {
         partial.observe(&event);
     }
 
-    verify(&path);
+    assert_eq!(path, logger.directory);
+    
+    verify(&path, "2");
 }

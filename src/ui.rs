@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write},
     path::Path,
     process::{Child, Command, Stdio},
@@ -39,7 +39,15 @@ pub fn run_child(
 ) -> Result<()> {
     if let Some(parent) = log_path.parent() { std::fs::create_dir_all(parent)?; }
 
-    let log = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
+    let file = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let existing = file.metadata()?.len() > 0;
+    let mut log = BufWriter::new(file);
+
+    if existing {
+        writeln!(log, "\n--- Bruce session started ---\n")?;
+    }
+
+    let log = Arc::new(Mutex::new(log));
     let interrupted = Arc::new(AtomicBool::new(false));
     let signal = interrupted.clone();
 
@@ -290,13 +298,14 @@ impl Display {
             self.between_superbatches = false;
         }
 
-        if let Some(message) = self.state.update(&event) {
-            if !matches!(event, Event::Metric { .. }) && (self.plain || !progress_event) {
-                self.message(&message)?;
+        if  let Some(message) = self.state.update(&event) &&
+            !matches!(event, Event::Metric { .. }) &&
+            (self.plain || !progress_event)
+        {
+            self.message(&message)?;
 
-                if matches!(event, Event::Note { .. }) {
-                    self.message("")?;
-                }
+            if matches!(event, Event::Note { .. }) {
+                self.message("")?;
             }
         }
 
