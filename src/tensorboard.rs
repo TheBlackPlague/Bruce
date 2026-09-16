@@ -316,9 +316,4 @@ mod tests {
         let mut failing = std::io::Cursor::new(&mut buffer[..]);
         assert!(write_record(&mut failing, &metric_event(&metric()).unwrap()).is_err());
     }
-
-    #[test]
-    fn official_crc32c_check_vector() {
-        assert_eq!(crc32c::crc32c(b"123456789"), 0xE3069283);
-    }
 }

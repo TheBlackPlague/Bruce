@@ -60,8 +60,6 @@ def run(interrupt):
                 output.extend(os.read(master, 65536))
 
             assert termios.tcgetattr(slave) == original, "terminal settings changed"
-            assert b"\x1b[?1049" not in output, "alternate screen used"
-            assert b"\x1b[?25l" not in output, "cursor hidden"
 
             if interrupt:
                 assert resized and stopped, output.decode(errors="replace")

@@ -156,13 +156,15 @@ fn execute(cli: Cli) -> Result<()> {
         _ => None,
     };
 
-    let log_path = match &training_config {
-        Some(config) => config.output_directory.join(format!("{}.log", config.name)),
+    let log_name = match &training_config {
+        Some(config) => format!("{}.log", config.name),
         None => {
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            std::env::current_dir()?.join("logs").join(format!("bruce-{stamp}.log"))
+            format!("bruce-{stamp}.log")
         }
     };
+
+    let log_path = std::env::current_dir()?.join("logs").join(log_name);
 
     let mut child = ProcessCommand::new(
         std::env::current_exe().context("Locating Bruce executable")?

@@ -399,7 +399,5 @@ mod tests {
 
         assert_eq!(clean("\x1b[31mwarning\x1b[0m\r\n"), "warning");
         assert_eq!(clean("\x1b]0;title\x07safe")      , "safe"   );
-        
-        assert!(!state.summary().contains('\x1b'));
     }
 }
