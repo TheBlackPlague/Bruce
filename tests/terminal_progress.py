@@ -47,12 +47,12 @@ def run(interrupt):
                 if select.select([master], [], [], 0.02)[0]:
                     output.extend(os.read(master, 65536))
 
-                if interrupt and b"Validating text" in output and not resized:
+                if interrupt and b"Converting dataset" in output and not resized:
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 35, 0, 0))
                     os.killpg(process.pid, signal.SIGWINCH)
                     resized = True
 
-                if resized and now > 0.3 and not stopped:
+                elif resized and not stopped:
                     os.killpg(process.pid, signal.SIGINT)
                     stopped = True
 

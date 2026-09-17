@@ -1,7 +1,7 @@
 use std::{
     cell::Cell,
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Seek, Write},
+    io::{BufRead, BufReader, BufWriter, Cursor, Seek, Write},
     path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant},
@@ -14,14 +14,18 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bullet_lib::game::formats::{
     bulletformat::{
-        self, BulletFormat, ChessBoard,
+        self, BulletFormat, ChessBoard, DataLoader,
         chess::{CudADFormat, MarlinFormat},
     },
-    montyformat::MontyValueFormat,
-    sfbinpack::CompressedTrainingDataEntryReader,
+    montyformat::{FastDeserialise, MontyValueFormat},
+    sfbinpack::{self, ChunkReader, TrainingDataEntry},
     viriformat::{
-        chess::board::{Board, DrawType, GameOutcome, WinType},
-        dataformat::Game,
+        chess::{
+            board::{Board, DrawType, GameOutcome, WinType},
+            piece::{Colour, Piece, PieceType},
+            types::Square,
+        },
+        dataformat::{Filter, Game},
     },
 };
 use clap::{Args, ValueEnum};
@@ -93,8 +97,8 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
 
     if options.from == DataFormat::Sf {
         reporter.emit(Event::Note {
-            message: "SF VALUE_NONE (32002) and unrepresentable -32768 scores are omitted because \
-                      they are not usable evaluation targets.".into(),
+            message: "SF VALUE_NONE (32002) is omitted; -32768 is omitted only when \
+                      the target requires an unrepresentable sign change.".into(),
         });
     }
 
@@ -136,257 +140,34 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
                 })?;
             }
 
-            DataFormat::Text => {
-                reporter.emit(Event::Phase {
-                    name: "Validating text".into(),
-                    completed: 0,
-                    total: Some(total),
-                });
-
-                let mut positions = 0u64;
-                finite::visit(
-                    &options.input,
-                    options.from,
-                    None,
-                    |board| {
-                        finite::validate_board(&board)?;
-                        positions += 1;
-                        Ok(false)
-                    },
-                    phase_progress(reporter, "Validating text", Some(total)),
-                )?;
-
-                observe_native_output(
-                    temporary.path(),
-                    Some(positions * size_of::<ChessBoard>() as u64),
-                    reporter,
-                    || {
-                        bulletformat::convert_from_text::<ChessBoard>(
-                            &options.input,
-                            temporary.path(),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-            }
-
-            _ => {
-                let mut writer = BufWriter::new(File::create(temporary.path())?);
-                let mut buffer = Vec::with_capacity(8192);
-                finite::visit_observed(
-                    &options.input,
-                    options.from,
-                    None,
-                    |board| {
-                        finite::validate_board(&board)?;
-                        buffer.push(board);
-                        if buffer.len() == 8192 {
-                            ChessBoard::write_to_bin(&mut writer, &buffer)?;
-                            buffer.clear();
-                        }
-                        Ok(false)
-                    },
-                    |bytes, written, omitted| {
-                        positions.set(written);
-                        skipped  .set(omitted);
-
-                        progress(bytes);
-                    },
-                )?;
-                ChessBoard::write_to_bin(&mut writer, &buffer)?;
-                writer.flush()?;
-            }
+            _ => convert_parallel(options, temporary.path(), |bytes, written, omitted| {
+                positions.set(written);
+                skipped.set(omitted);
+                progress(bytes);
+            })?,
         },
-
         OutputFormat::Viri => {
-            let mut writer = BufWriter::new(File::create(temporary.path())?);
-
-            match options.from {
-                DataFormat::Viri => {
-                    let mut reader = BufReader::new(File::open(&options.input)?);
-
-                    while !reader.fill_buf()?.is_empty() {
-                        let game = Game::deserialise_from(&mut reader, Vec::new())?;
-
-                        positions.set(positions.get() + game.moves.len() as u64);
-                        game.serialise_into(&mut writer)?;
-
-                        progress(reader.stream_position()?);
-                    }
-                }
-
-                DataFormat::Monty => {
-                    let mut reader = BufReader::new(File::open(&options.input)?);
-
-                    while !reader.fill_buf()?.is_empty() {
-                        let source = MontyValueFormat::deserialise_from(&mut reader, Vec::new())?;
-                        let mut board = board_from_fen(&source.startpos.as_fen())?;
-                        let mut game = Game::new(&board);
-
-                        game.set_outcome(outcome(source.result)?);
-
-                        positions.set(positions.get() + source.moves.len() as u64);
-
-                        for entry in source.moves {
-                            let mov = board.parse_uci(&entry.best_move.to_uci(&source.castling))?;
-                            game.add_move(mov, entry.score);
-
-                            ensure!(
-                                board.make_move_simple(mov),
-                                "illegal move while converting Monty game"
-                            );
-                        }
-
-                        game.serialise_into(&mut writer)?;
-
-                        progress(reader.stream_position()?);
-                    }
-                }
-
-                DataFormat::Sf => {
-                    reporter.emit(Event::Note {
-                        message: "SF records become single-position Viri games preserving \
-                                  position metadata, played move, score and result. \
-                                  SF VALUE_NONE scores are omitted.".into()
-                    });
-
-                    let mut reader = CompressedTrainingDataEntryReader::new(BufReader::new(
-                        File::open(&options.input)?,
-                    ))
-                    .map_err(|e| anyhow!("{e:?}"))?;
-
-                    let mut count = 0;
-                    while reader.has_next() {
-                        let entry = reader.next();
-
-                        count += 1;
-
-                        if !finite::valid_sf_score(entry.score) {
-                            skipped.set(skipped.get() + 1);
-
-                            if count % 8192 == 0 {
-                                progress(reader.read_bytes());
-                            }
-
-                            continue;
-                        }
-
-                        let board =
-                            board_from_fen(&entry.pos.fen().map_err(|e| anyhow!("{e:?}"))?)?;
-                        let mov = board.parse_uci(&entry.mv.as_uci())?;
-                        let black = entry.pos.side_to_move().ordinal() != 0;
-
-                        let result = f32::from(if black {
-                            1 - entry.result
-                        } else {
-                            1 + entry.result
-                        }) / 2.0;
-
-                        let score = if black { -entry.score } else { entry.score };
-
-                        let mut game = Game::new(&board);
-
-                        game.set_outcome(outcome(result)?);
-                        game.add_move(mov, score);
-                        game.serialise_into(&mut writer)?;
-
-                        positions.set(positions.get() + 1);
-
-                        if count % 8192 == 0 {
-                            progress(reader.read_bytes());
-                        }
-                    }
-                }
-
-                DataFormat::Text => {
-                    reporter.emit(Event::Note {
-                        message: "Text records become single-position Viri games preserving the \
-                                  FEN, score and result, with a synthetic legal move. \
-                                  Disable tactical-move filtering on these converted files.".into()
-                    });
-
-                    let mut reader = BufReader::new(File::open(&options.input)?);
-                    let mut line = String::new();
-                    let mut bytes = 0;
-
-                    while reader.read_line(&mut line)? != 0 {
-                        let record = line.trim().parse::<ChessBoard>().map_err(|e| anyhow!(e))?;
-
-                        finite::validate_board(&record)?;
-
-                        let fen = line.split('|').next().context("missing FEN")?.trim();
-                        let mut board = board_from_fen(fen)?;
-                        let black = fen.split_whitespace().nth(1) == Some("b");
-
-                        let score = if black {
-                            record
-                                .score()
-                                .checked_neg()
-                                .context("unrepresentable score")?
-                        } else {
-                            record.score()
-                        };
-
-                        let result = if black {
-                            1.0 - record.result()
-                        } else {
-                            record.result()
-                        };
-
-                        let mov = board
-                            .legal_moves()
-                            .into_iter()
-                            .next()
-                            .context(
-                                "terminal position cannot be represented as a scored Viri move; \
-                                 use Bullet output"
-                            )?;
-
-                        let mut game = Game::new(&board);
-
-                        game.set_outcome(outcome(result)?);
-                        game.add_move(mov, score);
-                        game.serialise_into(&mut writer)?;
-
-                        positions.set(positions.get() + 1);
-
-                        bytes += line.len() as u64;
-                        progress(bytes);
-
-                        line.clear();
-                    }
-                }
-
-                _ => {
-                    reporter.emit(Event::Note {
-                        message: "Position-only sources become single-position Viri games with a \
-                                  synthetic legal move. Bullet-normalized board orientation, \
-                                  score and result are preserved; unavailable clocks, castling \
-                                  rights and original game history cannot be recovered. \
-                                  Train these converted files with filters disabled. \
-                                  Terminal positions cannot be represented by a scored Viri move \
-                                  and cause an explicit error.".into()
-                    });
-
-                    finite::visit_observed(
-                        &options.input,
-                        options.from,
-                        None,
-                        |board| {
-                            position_game(board)?.serialise_into(&mut writer)?;
-                            Ok(false)
-                        },
-                        |bytes, written, omitted| {
-                            positions.set(written);
-                            skipped  .set(omitted);
-
-                            progress(bytes);
-                        },
-                    )?;
-                }
+            if matches!(options.from, DataFormat::Text | DataFormat::Bullet | DataFormat::Marlin | DataFormat::Cudad) {
+                reporter.emit(Event::Note {
+                    message: "Position-only sources use a synthetic legal move in Viri output; \
+                              disable tactical filtering. Terminal positions require Bullet \
+                              output. \
+                              Binary position-only sources retain Bullet-normalized orientation; \
+                              unavailable clocks, castling rights and game history cannot be \
+                              recovered.".into(),
+                });
+            } else if options.from == DataFormat::Sf {
+                reporter.emit(Event::Note {
+                    message: "SF records become single-position Viri games preserving position \
+                              metadata, played move, score and result.".into(),
+                });
             }
 
-            writer.flush()?;
+            convert_parallel(options, temporary.path(), |bytes, written, omitted| {
+                positions.set(written);
+                skipped.set(omitted);
+                progress(bytes);
+            })?;
         }
     }
 
@@ -402,7 +183,7 @@ pub fn convert(options: &ConvertOptions, reporter: &Reporter) -> Result<()> {
     if !matches!(
         (options.from, options.to),
         (
-            DataFormat::Bullet | DataFormat::Marlin | DataFormat::Cudad | DataFormat::Text,
+            DataFormat::Bullet | DataFormat::Marlin | DataFormat::Cudad,
             OutputFormat::Bullet
         )
     ) {
@@ -470,29 +251,430 @@ fn observe_native_output(
     })
 }
 
-fn phase_progress<'a>(
-    reporter: &'a Reporter,
-    name: &'a str,
-    total: Option<u64>,
-) -> impl Fn(u64) + 'a {
-    let last = Cell::new(Instant::now());
+fn convert_parallel(
+    options: &ConvertOptions,
+    output: &Path,
+    mut progress: impl FnMut(u64, u64, u64),
+) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(output)?);
+    let mut written = 0;
+    let mut skipped = 0;
+    let mut complete = |bytes, counts: (u64, u64)| {
+        written += counts.0;
+        skipped += counts.1;
+        progress(bytes, written, skipped);
+    };
 
-    move |completed| {
-        if last.get().elapsed() >= Duration::from_millis(200) || total == Some(completed) {
-            reporter.emit(Event::Phase {
-                name: name.into(),
-                completed,
-                total,
-            });
+    if matches!(
+        options.from,
+        DataFormat::Bullet | DataFormat::Marlin | DataFormat::Cudad
+    ) {
+        macro_rules! fixed {
+            ($source:ty) => {{
+                let mut bytes = <$source>::HEADER_SIZE as u64;
+                let mut result = Ok(());
 
-            last.set(Instant::now());
+                DataLoader::<$source>::new(&options.input, 8)?.map_batches(8192, |batch| {
+                    if result.is_err() {
+                        return;
+                    }
+
+                    result = write_parallel(batch, options.threads, &mut writer, |record, output| {
+                        position_game(ChessBoard::from(*record))?.serialise_into(output)?;
+
+                        Ok((1, 0))
+                    }).map(|counts| {
+                        bytes += size_of_val(batch) as u64;
+                        complete(bytes, counts);
+                    });
+                });
+
+                result?;
+            }};
+        }
+
+        match options.from {
+            DataFormat::Bullet => fixed!( ChessBoard ),
+            DataFormat::Marlin => fixed!(MarlinFormat),
+            DataFormat::Cudad  => fixed!( CudADFormat),
+
+            _ => unreachable!(),
+        }
+    } else {
+        let mut reader = BufReader::new(File::open(&options.input)?);
+
+        loop {
+            let mut batch = Vec::new();
+            let mut batch_bytes = 0;
+
+            let limit = if options.from == DataFormat::Sf {
+                options.threads
+            } else {
+                8192
+            };
+
+            while batch.len() < limit && batch_bytes < 16 * 1024 * 1024 {
+                if reader.fill_buf()?.is_empty() {
+                    break;
+                }
+
+                let mut bytes = Vec::new();
+
+                match options.from {
+                    DataFormat::Sf => {
+                        if !sfbinpack::read_chunk_into(&mut reader, &mut bytes)? {
+                            break;
+                        }
+                    }
+
+                    DataFormat::Monty => {
+                        MontyValueFormat::deserialise_fast_into_buffer(&mut reader, &mut bytes)?
+                    }
+
+                    DataFormat::Viri => {
+                        Game::deserialise_fast_into_buffer(&mut reader, &mut bytes)?
+                    }
+
+                    DataFormat::Text => {
+                        reader.read_until(b'\n', &mut bytes)?;
+                    }
+
+                    _ => unreachable!(),
+                }
+
+                batch_bytes += bytes.len();
+                batch.push(bytes);
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let counts = write_parallel(&batch, options.threads, &mut writer, |bytes, output| {
+                convert_unit(bytes, options.from, options.to, output)
+            })?;
+
+            complete(reader.stream_position()?, counts);
         }
     }
+
+    writer.flush()?;
+
+    Ok(())
+}
+
+fn write_parallel<T: Sync>(
+    batch: &[T],
+    threads: usize,
+    writer: &mut impl Write,
+    convert: impl Fn(&T, &mut Vec<u8>) -> Result<(u64, u64)> + Sync,
+) -> Result<(u64, u64)> {
+    std::thread::scope(|scope| {
+        let convert = &convert;
+
+        let handles = batch.chunks(batch.len().div_ceil(threads)).map(|part| {
+            scope.spawn(move || -> Result<_> {
+                let mut output = Vec::new();
+                let mut counts = (0, 0);
+
+                for item in part {
+                    let (written, skipped) = convert(item, &mut output)?;
+
+                    counts.0 += written;
+                    counts.1 += skipped;
+                }
+
+                Ok((output, counts))
+            })
+        }).collect::<Vec<_>>();
+
+        let mut counts = (0, 0);
+
+        for handle in handles {
+            let (output, count) = handle.join().map_err(
+                |_| anyhow!("conversion worker panicked")
+            )??;
+
+            writer.write_all(&output)?;
+
+            counts.0 += count.0;
+            counts.1 += count.1;
+        }
+
+        Ok(counts)
+    })
+}
+
+fn convert_unit(
+    bytes: &[u8],
+    from: DataFormat,
+    to: OutputFormat,
+    output: &mut Vec<u8>,
+) -> Result<(u64, u64)> {
+    let mut counts = (0, 0);
+
+    match from {
+        DataFormat::Sf => {
+            let mut reader = ChunkReader::default();
+
+            while reader.has_next(bytes) {
+                let entry = reader.next(bytes);
+
+                let black = entry.pos.side_to_move().ordinal() != 0;
+
+                if  entry.score == 32002 ||
+                    (matches!(to, OutputFormat::Viri) && black && entry.score == i16::MIN)
+                {
+                    counts.1 += 1;
+                    continue;
+                }
+
+                match to {
+                    OutputFormat::Bullet => output.extend_from_slice(ChessBoard::as_bytes_slice(
+                        &[finite::sf_board(&entry)?],
+                    )),
+
+                    OutputFormat::Viri => {
+                        let board = sf_viri_board(&entry)?;
+                        let mov = board.parse_uci(&entry.mv.as_uci())?;
+
+                        let score = if black { -entry.score } else { entry.score };
+
+                        let result = f32::from(if black {
+                            1 - entry.result
+                        } else {
+                            1 + entry.result
+                        }) / 2.0;
+
+                        let mut game = Game::new(&board);
+
+                        game.set_outcome(outcome(result)?);
+                        game.add_move(mov, score);
+                        game.serialise_into(output)?;
+                    }
+                }
+
+                counts.0 += 1;
+            }
+        }
+
+        DataFormat::Monty => {
+            let source = MontyValueFormat::deserialise_from(&mut Cursor::new(bytes), Vec::new())?;
+
+            counts.0 = source.moves.len() as u64;
+
+            match to {
+                OutputFormat::Bullet => {
+                    let mut pos = source.startpos;
+
+                    for entry in source.moves {
+                        let record = ChessBoard::from_raw(
+                            pos.bbs(),
+                            pos.stm(),
+                            entry.score,
+                            source.result
+                        ).map_err(|e| anyhow!(e))?;
+
+                        output.extend_from_slice(ChessBoard::as_bytes_slice(&[record]));
+
+                        pos.make(entry.best_move, &source.castling);
+                    }
+                }
+
+                OutputFormat::Viri => {
+                    let mut board = monty_viri_board(&source);
+                    let mut game = Game::new(&board);
+
+                    game.set_outcome(outcome(source.result)?);
+
+                    for entry in source.moves {
+                        let mov = board.parse_uci(&entry.best_move.to_uci(&source.castling))?;
+
+                        game.add_move(mov, entry.score);
+                        board.make_move_simple(mov);
+                    }
+
+                    game.serialise_into(output)?;
+                }
+            }
+        }
+
+        DataFormat::Viri => {
+            let game = Game::deserialise_from(&mut Cursor::new(bytes), Vec::new())?;
+
+            match to {
+                OutputFormat::Bullet => game.splat_to_bulletformat(
+                    |board| {
+                        output.extend_from_slice(ChessBoard::as_bytes_slice(&[board]));
+
+                        counts.0 += 1;
+
+                        Ok(())
+                    },
+                    &Filter::UNRESTRICTED,
+                )?,
+
+                OutputFormat::Viri => {
+                    game.serialise_into(output)?;
+                    counts.0 = game.len() as u64;
+                }
+            }
+        }
+
+        DataFormat::Text => {
+            let line = std::str::from_utf8(bytes)?.trim_end_matches(['\r', '\n']);
+            match to {
+                OutputFormat::Bullet => {
+                    let record = line.parse::<ChessBoard>().map_err(|e| anyhow!(e))?;
+
+                    output.extend_from_slice(ChessBoard::as_bytes_slice(&[record]));
+                }
+
+                OutputFormat::Viri => {
+                    let mut fields = line.split('|').map(str::trim);
+                    let mut board = board_from_fen(fields.next().context("missing FEN")?)?;
+                    let score = fields.next().context("missing score")?.parse::<i16>()?;
+                    let result = fields.next().context("missing result")?;
+
+                    let result = match result {
+                        "1.0" | "[1.0]" | "1"   => 1.0,
+                        "0.5" | "[0.5]" | "1/2" => 0.5,
+                        "0.0" | "[0.0]" | "0"   => 0.0,
+                        _ => bail!("invalid text result {result}"),
+                    };
+
+                    let mov = board
+                        .legal_moves()
+                        .into_iter()
+                        .next()
+                        .context("terminal position requires Bullet output")?;
+
+                    let mut game = Game::new(&board);
+
+                    game.set_outcome(outcome(result)?);
+                    game.add_move(mov, score);
+
+                    game.serialise_into(output)?;
+                }
+            }
+
+            counts.0 = 1;
+        }
+
+        _ => unreachable!(),
+    }
+
+    Ok(counts)
+}
+
+fn board_from_bitboards(bbs: [u64; 8]) -> Board {
+    let mut board = Board::new();
+
+    for (kind, &pieces) in bbs[2..].iter().enumerate() {
+        let mut pieces = pieces;
+
+        while pieces != 0 {
+            let square = pieces.trailing_zeros() as u8;
+
+            pieces &= pieces - 1;
+
+            board.add_piece(
+                Square::new(square).unwrap(),
+                Piece::new(
+                    Colour::new(bbs[1] & (1 << square) != 0),
+                    PieceType::new(kind as u8).unwrap(),
+                ),
+            );
+        }
+    }
+
+    board
+}
+
+fn finish_board(board: &mut Board) {
+    board.regenerate_zobrist();
+    board.regenerate_threats();
+}
+
+fn sf_viri_board(entry: &TrainingDataEntry) -> Result<Board> {
+    use sfbinpack::chess::castling_rights::CastlingRights as SfRights;
+
+    let pos = &entry.pos;
+    let mut board = board_from_bitboards(finite::sf_bitboards(entry));
+
+    *board.turn_mut() = Colour::new(pos.side_to_move().ordinal() != 0);
+    *board.ep_sq_mut() = Square::new(pos.ep_square().index() as u8);
+    *board.halfmove_clock_mut() = pos.rule50_counter().try_into()?;
+
+    board.set_fullmove_clock(pos.ply() / 2 + 1);
+
+    for (colour, king, queen, offset) in [
+        (
+            Colour::White,
+            SfRights::WHITE_KING_SIDE,
+            SfRights::WHITE_QUEEN_SIDE,
+            0,
+        ),
+        (
+            Colour::Black,
+            SfRights::BLACK_KING_SIDE,
+            SfRights::BLACK_QUEEN_SIDE,
+            56,
+        ),
+    ] {
+        if pos.castling_rights().contains(king ) {
+            *board.castling_rights_mut().kingside_mut (colour) = Square::new(offset + 7);
+        }
+
+        if pos.castling_rights().contains(queen) {
+            *board.castling_rights_mut().queenside_mut(colour) = Square::new(offset    );
+        }
+    }
+
+    finish_board(&mut board);
+
+    Ok(board)
+}
+
+fn monty_viri_board(source: &MontyValueFormat) -> Board {
+    let pos = &source.startpos;
+    let mut board = board_from_bitboards(pos.bbs());
+
+    *board.turn_mut() = Colour::new(pos.stm() != 0);
+    *board.ep_sq_mut() = if pos.enp_sq() == 0 {
+        None
+    } else {
+        Square::new(pos.enp_sq())
+    };
+    *board.halfmove_clock_mut() = pos.halfm();
+
+    board.set_fullmove_clock(pos.fullm());
+
+    for (side, colour) in [(0, Colour::White), (1, Colour::Black)] {
+        let rooks = source.castling.rook_files()[side];
+
+        if pos.rights() & (8 >> (2 * side)) != 0 {
+            *board.castling_rights_mut().queenside_mut(colour) = Square::new(
+                56 * side as u8 + rooks[0]
+            );
+        }
+
+        if pos.rights() & (4 >> (2 * side)) != 0 {
+            *board.castling_rights_mut().kingside_mut(colour) = Square::new(
+                56 * side as u8 + rooks[1]
+            );
+        }
+    }
+
+    finish_board(&mut board);
+
+    board
 }
 
 fn board_from_fen(fen: &str) -> Result<Board> {
     let mut board = Board::new();
     board.set_from_fen(fen)?;
+
     Ok(board)
 }
 
@@ -507,66 +689,23 @@ fn outcome(result: f32) -> Result<GameOutcome> {
 }
 
 fn position_game(record: ChessBoard) -> Result<Game> {
-    finite::validate_board(&record)?;
+    let mut board = Board::new();
 
-    let mut squares = [' '; 64];
     for (piece, square) in record {
-        squares[usize::from(square)] = match piece {
-             0 => 'P',
-             1 => 'N',
-             2 => 'B',
-             3 => 'R',
-             4 => 'Q',
-             5 => 'K',
-             8 => 'p',
-             9 => 'n',
-            10 => 'b',
-            11 => 'r',
-            12 => 'q',
-            13 => 'k',
-
-            _ => unreachable!("validated piece"),
-        };
+        board.add_piece(
+            Square::new(square).context("invalid square")?,
+            Piece::new(
+                Colour::new(piece & 8 != 0),
+                PieceType::new(piece & 7).context("invalid piece")?,
+            ),
+        );
     }
 
-    let mut fen = String::new();
-    for rank in (0..8).rev() {
-        let mut empty = 0;
-        for file in 0..8 {
-            let piece = squares[8 * rank + file];
+    finish_board(&mut board);
 
-            if piece == ' ' {
-                empty += 1;
-            } else {
-                if empty > 0 {
-                    fen.push(char::from(b'0' + empty));
-                    empty = 0;
-                }
-
-                fen.push(piece);
-            }
-        }
-
-        if empty > 0 {
-            fen.push(char::from(b'0' + empty));
-        }
-
-        if rank != 0 {
-            fen.push('/');
-        }
-    }
-
-    fen.push_str(" w - - 0 1");
-
-    let mut board = board_from_fen(&fen)?;
-    let mov = board
-        .legal_moves()
-        .into_iter()
-        .next()
-        .context(
-            "terminal position has no legal move: \
-             use Bullet output, since Viri stores scores on moves"
-        )?;
+    let mov = board.legal_moves().into_iter().next().context(
+        "terminal position has no legal move: use Bullet output, since Viri stores scores on moves",
+    )?;
 
     let mut game = Game::new(&board);
 
@@ -580,6 +719,45 @@ fn position_game(record: ChessBoard) -> Result<Game> {
 mod tests {
     use super::*;
     use bullet_lib::game::formats::viriformat::dataformat::Filter;
+
+    #[test]
+    fn direct_boards_preserve_position_metadata() {
+        use bullet_lib::game::formats::{montyformat::chess::Castling, sfbinpack::chess};
+
+        for fen in [
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 17 42",
+            "r3k2r/8/8/8/8/8/8/R3K2R b Qk - 17 42",
+            "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 42",
+            "4k3/8/8/8/3Pp3/8/8/4K3 b - d3 0 42",
+        ] {
+            let expected = board_from_fen(fen).unwrap();
+            let entry = TrainingDataEntry {
+                pos: chess::position::Position::from_fen(fen).unwrap(),
+                mv: chess::r#move::Move::normal(
+                    chess::coords::Square::new(4),
+                    chess::coords::Square::new(5),
+                ),
+                score: -250,
+                ply: 82,
+                result: -1,
+            };
+
+            assert_eq!(sf_viri_board(&entry).unwrap(), expected, "SF: {fen}");
+
+            let mut castling = Castling::default();
+            let source = MontyValueFormat {
+                startpos: bullet_lib::game::formats::montyformat::chess::Position::parse_fen(
+                    fen,
+                    &mut castling,
+                ),
+                castling,
+                result: 0.0,
+                moves: Vec::new(),
+            };
+            
+            assert_eq!(monty_viri_board(&source), expected, "Monty: {fen}");
+        }
+    }
 
     #[test]
     fn viri_roundtrip_retains_black_stm_features_score_and_result() {
@@ -693,7 +871,7 @@ mod tests {
                      input:  input.clone(),
                     output: output.clone(),
 
-                    threads: 1,
+                    threads: 3,
                 },
                 &Reporter::silent(),
             )
@@ -771,7 +949,7 @@ mod tests {
                      input:  input.clone(),
                     output: output.clone(),
 
-                    threads: 1,
+                    threads: 3,
                 },
                 &Reporter::silent(),
             )
@@ -825,7 +1003,7 @@ mod tests {
                         to: target,
                         input: input.clone(),
                         output: output.clone(),
-                        threads: 1,
+                        threads: 3,
                     },
                     &Reporter::silent(),
                 )
