@@ -162,8 +162,7 @@ dependencies = [
 [[package]]
 name = "bulletformat"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d171953264e8dc3aa62757255e602e507fdd358a94e3cdacb9e481ff3a1c6b0"
+source = "git+https://github.com/jw1912/bulletformat?rev=eddd9a2d77dbc1391d68f23ba524657e91bd9a73#eddd9a2d77dbc1391d68f23ba524657e91bd9a73"
 
 [[package]]
 name = "bumpalo"
