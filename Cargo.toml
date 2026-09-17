@@ -33,3 +33,6 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+bulletformat = { git = "https://github.com/jw1912/bulletformat", rev = "eddd9a2d77dbc1391d68f23ba524657e91bd9a73" }
