@@ -1,0 +1,41 @@
+# Toolchain
+edition = "2024"
+style_edition = "2024"
+unstable_features = true
+
+# Indentation and line widths
+hard_tabs = false
+tab_spaces = 4
+max_width = 120
+indent_style = "Block"
+use_small_heuristics = "Max"
+
+# Braces
+brace_style = "AlwaysNextLine"
+control_brace_style = "AlwaysSameLine"
+
+# Function and expression formatting
+fn_params_layout = "Tall"
+fn_single_line = true
+empty_item_single_line = true
+where_single_line = false
+binop_separator = "Front"
+
+# Column alignment
+# struct_field_align_threshold = 30
+# enum_discrim_align_threshold = 30
+
+# Strings and comments
+format_strings = true
+wrap_comments = false
+
+# Whitespace
+blank_lines_lower_bound = 0
+blank_lines_upper_bound = 1
+
+# Imports
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
+# Match expressions
+match_block_trailing_comma = true

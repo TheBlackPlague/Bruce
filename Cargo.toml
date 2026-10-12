@@ -1,8 +1,8 @@
 [package]
 name = "bruce"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 description = "Neural Network Trainer Interface for StockDory"
 repository = "https://github.com/TheBlackPlague/Bruce"
 
@@ -14,21 +14,21 @@ metal = ["bullet_lib/metal", "bullet-trainer/metal", "bullet-gpu/metal"]
 
 [dependencies]
 anyhow = "1"
-bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
-bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
-bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "2ea3d2d0f7e597b0d645f6e8040cf37818f51bce", default-features = false }
-bulletformat = "1.8"
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
+bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
+bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
+bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6" }
 clap = { version = "4.5", features = ["derive"] }
-indicatif = "0.18"
-prost = "0.14"
 crc32c = "0.6"
 ctrlc = "3.4"
+indicatif = "0.18"
+prost = "0.14"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
-toml = "0.8"
-
 tempfile = "3"
+toml = "0.8"
 
 [profile.release]
 lto = "thin"
@@ -36,3 +36,10 @@ codegen-units = 1
 
 [patch.crates-io]
 bulletformat = { git = "https://github.com/jw1912/bulletformat", rev = "eddd9a2d77dbc1391d68f23ba524657e91bd9a73" }
+
+# The upstream codec relies on wrapping negation for the minimum i16 score
+[profile.dev.package.sfbinpack]
+overflow-checks = false
+
+[profile.test.package.sfbinpack]
+overflow-checks = false

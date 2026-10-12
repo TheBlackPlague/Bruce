@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -8,235 +9,476 @@ use bullet_trainer::optimiser::adam::AdamWParams;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    data::DataConfig,
-    schedule::{LrConfig, WdlConfig},
+    architecture::Architecture,
+    data::Format,
+    schedule::{self, BATCHES_PER_SUPERBATCH, LrSchedule, LrSpec, Phase, WdlSchedule, WdlSpec},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub schema_version: u32,
+#[derive(Clone, Debug)]
+pub struct Config
+{
     pub name: String,
-    #[serde(default = "architecture")]
     pub architecture: String,
-    pub output_directory: PathBuf,
-    #[serde(default = "seed")]
     pub seed: u64,
-    #[serde(default)]
     pub device: i32,
+    pub tensorboard: TensorboardConfig,
     pub training: TrainingConfig,
     pub data: DataConfig,
-    #[serde(default)]
     pub optimizer: OptimizerConfig,
-    pub learning_rate: LrConfig,
-    pub wdl: WdlConfig,
+    pub learning_rate: LrSchedule,
+    pub wdl: WdlSchedule,
+    schedules: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TrainingConfig {
-    pub batch_size: usize,
-    pub batches_per_superbatch: usize,
+#[derive(Clone, Debug, Serialize)]
+pub struct TrainingConfig
+{
     pub superbatches: usize,
-    pub save_every: usize,
-    #[serde(default = "log_every")]
     pub log_every: usize,
+    pub checkpoint: CheckpointConfig,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TensorboardConfig
+{
+    pub enabled: bool,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CheckpointConfig
+{
+    pub location: PathBuf,
+    pub policy: CheckpointPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub enum CheckpointPolicy
+{
+    Periodic
+    {
+        superbatch: usize
+    },
+    Single
+    {
+        superbatch: usize
+    },
+}
+
+impl CheckpointPolicy
+{
+    pub fn should_save(self, superbatch: usize) -> bool
+    {
+        match self {
+            Self::Periodic { superbatch: period } => superbatch > 0 && period > 0 && superbatch.is_multiple_of(period),
+            Self::Single { superbatch: target } => superbatch == target,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DataConfig
+{
+    pub buffer_size_mb: usize,
+    pub loader_threads: usize,
+    pub mapping_threads: u8,
+    pub batch_size: usize,
+    pub sources: Vec<DataSource>,
+    pub filter: Option<Filter>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataSource
+{
+    pub format: Format,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub separator: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct OptimizerConfig {
+pub struct Filter
+{
+    pub minimum_ply: u16,
+    pub maximum_ply: Option<u16>,
+    pub minimum_pieces: u32,
+    pub minimum_eval: u32,
+    pub maximum_eval: u32,
+    pub exclude_tactical: bool,
+    pub exclude_check: bool,
+}
+
+impl Default for Filter
+{
+    fn default() -> Self
+    {
+        Self {
+            minimum_ply: 0,
+            maximum_ply: None,
+            minimum_pieces: 0,
+            minimum_eval: 0,
+            maximum_eval: 32768,
+            exclude_tactical: false,
+            exclude_check: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OptimizerConfig
+{
+    pub minimum_weight: f32,
+    pub maximum_weight: f32,
     pub decay: f32,
     pub beta1: f32,
     pub beta2: f32,
-    pub min_weight: f32,
-    pub max_weight: f32,
 }
 
-fn architecture() -> String {
-    "Aurora".into()
-}
-
-fn seed() -> u64 {
-    42
-}
-
-fn log_every() -> usize {
-    32
-}
-
-impl Default for OptimizerConfig {
-    fn default() -> Self {
-        let p = AdamWParams::default();
-        Self {
-            decay: p.decay,
-            beta1: p.beta1,
-            beta2: p.beta2,
-            min_weight: p.min_weight,
-            max_weight: p.max_weight,
-        }
-    }
-}
-
-impl OptimizerConfig {
-    pub fn params(&self) -> AdamWParams {
+impl OptimizerConfig
+{
+    pub fn params(&self) -> AdamWParams
+    {
         AdamWParams {
+            min_weight: self.minimum_weight,
+            max_weight: self.maximum_weight,
             decay: self.decay,
             beta1: self.beta1,
             beta2: self.beta2,
-            min_weight: self.min_weight,
-            max_weight: self.max_weight,
         }
     }
 }
 
-impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("Cannot read configuration {}", path.display()))?;
-        let mut config: Self = toml::from_str(&source).context("Invalid training TOML")?;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig
+{
+    schema: Schema,
+    config: Identity,
+    random: Random,
+    hardware: Hardware,
+    tensorboard: TensorboardConfig,
+    training: Training,
+}
 
-        let parent = fs::canonicalize(path)?
-            .parent()
-            .context("Configuration has no parent directory")?
-            .to_path_buf();
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Schema
+{
+    version: u32,
+}
 
-        if config.output_directory.is_relative() {
-            config.output_directory = parent.join(&config.output_directory);
-        }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Identity
+{
+    name: String,
+    arch: String,
+}
 
-        for path in &mut config.data.paths {
-            if path.is_relative() {
-                *path = parent.join(&*path);
-            }
-        }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Random
+{
+    seed: u64,
+}
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Hardware
+{
+    gpu: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Training
+{
+    superbatches: usize,
+    #[serde(default = "log_every")]
+    log_every: usize,
+    checkpoint: Checkpoint,
+    data: Data,
+    optimizer: Optimizer,
+    lr: BTreeMap<String, Phase<LrSpec>>,
+    wdl: BTreeMap<String, Phase<WdlSpec>>,
+}
+
+fn log_every() -> usize { 32 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Checkpoint
+{
+    Periodic
+    {
+        location: PathBuf, periodic: Interval
+    },
+    Single
+    {
+        location: PathBuf, single: Interval
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Interval
+{
+    superbatch: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Data
+{
+    buffer: Buffer,
+    threads: Threads,
+    batch: Batch,
+    source: BTreeMap<String, DataSource>,
+    #[serde(default)]
+    filter: Option<Filter>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Buffer
+{
+    size_mb: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Threads
+{
+    loader: usize,
+    mapper: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Batch
+{
+    size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Optimizer
+{
+    minimum_weight: f32,
+    maximum_weight: f32,
+    adamw: AdamW,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdamW
+{
+    decay: f32,
+    beta1: f32,
+    beta2: f32,
+}
+
+impl Config
+{
+    pub fn load(path: &Path) -> Result<Self>
+    {
+        let source = fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+        Self::from_toml(&source)
+    }
+
+    pub fn from_toml(source: &str) -> Result<Self>
+    {
+        let file: FileConfig = toml::from_str(source).context("Invalid training configuration")?;
+        ensure!(file.schema.version == 1, "Unsupported configuration version");
+        
+        let schedules = serde_json::json!({"learning_rate": file.training.lr, "wdl": file.training.wdl});
+        let training = file.training;
+        ensure!(training.superbatches > 0 && training.superbatches < usize::MAX, "Training counts must be positive");
+        
+        let checkpoint_config = match training.checkpoint {
+            Checkpoint::Periodic { location, periodic } => {
+                CheckpointConfig { location, policy: CheckpointPolicy::Periodic { superbatch: periodic.superbatch } }
+            },
+            Checkpoint::Single { location, single } => {
+                CheckpointConfig { location, policy: CheckpointPolicy::Single { superbatch: single.superbatch } }
+            },
+        };
+        
+        let data = training.data;
+        let optimizer = training.optimizer;
+        
+        let config = Self {
+            name: file.config.name,
+            architecture: file.config.arch,
+            seed: file.random.seed,
+            device: file.hardware.gpu,
+            tensorboard: file.tensorboard,
+            training: TrainingConfig {
+                superbatches: training.superbatches,
+                log_every: training.log_every,
+                checkpoint: checkpoint_config,
+            },
+            data: DataConfig {
+                buffer_size_mb: data.buffer.size_mb,
+                loader_threads: data.threads.loader,
+                mapping_threads: data.threads.mapper,
+                batch_size: data.batch.size,
+                sources: schedule::indexed(data.source, "Data source")?,
+                filter: data.filter,
+            },
+            optimizer: OptimizerConfig {
+                minimum_weight: optimizer.minimum_weight,
+                maximum_weight: optimizer.maximum_weight,
+                decay: optimizer.adamw.decay,
+                beta1: optimizer.adamw.beta1,
+                beta2: optimizer.adamw.beta2,
+            },
+            learning_rate: schedule::learning_rate(training.lr, training.superbatches)?,
+            wdl: schedule::wdl(training.wdl, training.superbatches)?,
+            schedules,
+        };
         config.validate()?;
-
+        
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.schema_version == 1,
-            "Unsupported schema_version {}; expected 1",
-            self.schema_version
-        );
-        ensure!(
-            self.architecture == "Aurora",
-            "Only the Aurora chess architecture is supported"
-        );
+    pub fn checkpoint_value(&self) -> serde_json::Value
+    {
+        serde_json::json!({
+            "name": self.name,
+            "architecture": self.architecture,
+            "seed": self.seed,
+            "device": self.device,
+            "training": self.training,
+            "data": self.data,
+            "optimizer": self.optimizer,
+            "learning_rate": self.schedules["learning_rate"],
+            "wdl": self.schedules["wdl"],
+        })
+    }
+
+    pub fn validate(&self) -> Result<()>
+    {
         ensure!(
             !self.name.is_empty()
                 && self.name.len() <= 100
-                && self
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "name must use 1–100 ASCII letters, digits, '-' or '_'"
+                && self.name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "Name must use 1 to 100 letters, numbers, '-' or '_'"
         );
-        ensure!(self.device >= 0, "device must be a nonnegative GPU ordinal");
-
-        let t = &self.training;
-
+        
+        self.architecture.parse::<Architecture>()?;
+        
+        ensure!(self.device >= 0, "GPU number cannot be negative");
+        
         ensure!(
-            t.batch_size > 0
-                && t.batches_per_superbatch > 0
-                && t.superbatches > 0
-                && t.save_every > 0
-                && t.log_every > 0,
-            "All training counts must be greater than zero"
+            self.training.superbatches > 0 && self.training.superbatches < usize::MAX && self.training.log_every > 0,
+            "Training counts must be positive"
         );
-
-        t.batch_size
-            .checked_mul(t.batches_per_superbatch)
-            .and_then(|n| n.checked_mul(t.superbatches))
-            .context("Training position count overflows this platform")?;
-
-        ensure!(t.superbatches < usize::MAX, "superbatches is too large");
-        ensure!(
-            !self.output_directory.as_os_str().is_empty(),
-            "output_directory cannot be empty"
-        );
-        ensure!(
-            !self.data.paths.is_empty(),
-            "At least one dataset path is required"
-        );
-        ensure!(
-            self.data.loader_threads > 0
-                && self.data.mapping_threads > 0
-                && self.data.buffer_size_mb > 0,
-            "Loader threads, mapping threads, and buffer_size_mb must be positive"
-        );
-
         self.data
-            .buffer_size_mb
-            .checked_mul(1024 * 1024)
-            .context("buffer_size_mb overflows this platform")?;
-
-        let p = &self.optimizer;
-
+            .batch_size
+            .checked_mul(BATCHES_PER_SUPERBATCH)
+            .and_then(|count| count.checked_mul(self.training.superbatches))
+            .context("Training is too large")?;
+        
+        ensure!(!self.training.checkpoint.location.as_os_str().is_empty(), "Checkpoint location cannot be empty");
+        match self.training.checkpoint.policy {
+            CheckpointPolicy::Periodic { superbatch } => {
+                ensure!(superbatch > 0, "Checkpoint interval must be positive");
+            },
+            CheckpointPolicy::Single { superbatch } => {
+                ensure!(
+                    superbatch > 0 && superbatch <= self.training.superbatches,
+                    "Checkpoint superbatch must fall within training"
+                );
+            },
+        }
+        
         ensure!(
-            p.decay.is_finite() && p.decay >= 0.0,
-            "optimizer.decay must be finite and nonnegative"
+            !self.tensorboard.enabled || !self.tensorboard.path.as_os_str().is_empty(),
+            "TensorBoard path cannot be empty"
+        );
+        
+        self.data.validate()?;
+        
+        let optimizer = &self.optimizer;
+        ensure!(optimizer.decay.is_finite() && optimizer.decay >= 0.0, "Weight decay must be finite and nonnegative");
+        ensure!(
+            (0.0..1.0).contains(&optimizer.beta1) && (0.0..1.0).contains(&optimizer.beta2),
+            "AdamW betas must be between 0 and 1"
         );
         ensure!(
-            p.beta1.is_finite()
-                && (0.0..1.0).contains(&p.beta1)
-                && p.beta2.is_finite()
-                && (0.0..1.0).contains(&p.beta2),
-            "AdamW betas must be finite and in [0, 1)"
+            optimizer.minimum_weight.is_finite()
+                && optimizer.maximum_weight.is_finite()
+                && optimizer.minimum_weight < optimizer.maximum_weight
+                && optimizer.minimum_weight >= -2.0
+                && optimizer.maximum_weight <= 2.0,
+            "Weight limits must be ordered within [-2, 2]"
         );
-        ensure!(
-            p.min_weight.is_finite() && p.max_weight.is_finite() && p.min_weight < p.max_weight,
-            "Invalid optimizer clipping range"
-        );
-        ensure!(
-            p.min_weight >= -2.0 && p.max_weight <= 2.0,
-            "Aurora's i16 output bias requires clipping within [-2, 2]"
-        );
-
-        self.data         .validate(              )?;
-        self.learning_rate.validate(t.superbatches)?;
-        self.wdl          .validate(t.superbatches)?;
-
+        
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl DataConfig
+{
+    pub fn validate(&self) -> Result<()>
+    {
+        ensure!(self.batch_size > 0, "Batch size must be positive");
+        ensure!((1..=1_048_576).contains(&self.buffer_size_mb), "Buffer size must be between 1 and 1048576 MB");
+        self.buffer_size_mb.checked_mul(1024 * 1024).context("Buffer is too large")?;
+        
+        ensure!(
+            (1..=256).contains(&self.loader_threads) && self.mapping_threads > 0,
+            "Loader and mapper counts must be positive; at most 256 loaders are supported"
+        );
+        
+        ensure!(!self.sources.is_empty(), "At least one data source is required");
 
-    //noinspection SpellCheckingInspection
-    #[test]
-    fn example_and_strict_toml() {
-        let source = include_str!("../config/training.toml");
-        let config: Config = toml::from_str(source).unwrap();
+        for source in &self.sources {
+            ensure!(
+                !source.path.as_os_str().is_empty() && source.path.to_str().is_some(),
+                "Dataset path must be nonempty UTF-8"
+            );
+            
+            match (&source.format, &source.separator) {
+                (Format::Text, Some(separator)) => ensure!(
+                    !separator.is_empty() && !separator.contains(['\n', '\r']),
+                    "Text separator must be nonempty and stay on one line"
+                ),
+                (Format::Text, None) => anyhow::bail!("Text sources need a separator"),
+                (_, Some(_)) => anyhow::bail!("Separators are only used with text sources"),
+                _ => {},
+            }
+        }
 
-        config.validate().unwrap();
-
-        assert!(toml::from_str::<Config>(&format!("{source}\n[training]\nbatch_size=8")).is_err());
-        assert!(toml::from_str::<Config>(&source.replace("batch_size =", "batch_szie =")).is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_numeric_settings() {
-        let base: Config = toml::from_str(include_str!("../config/training.toml")).unwrap();
-        let mut config = base.clone();
-
-        config.training.batch_size = 0;
-
-        assert!(config.validate().is_err());
-
-        config = base.clone();
-        config.optimizer.beta2 = f32::NAN;
-
-        assert!(config.validate().is_err());
-
-        config = base;
-        config.training.superbatches = usize::MAX;
-
-        assert!(config.validate().is_err());
+        if let Some(filter) = &self.filter {
+            ensure!(
+                filter.minimum_eval < filter.maximum_eval && filter.maximum_eval <= 32768,
+                "Evaluation bounds must be ordered between 0 and 32768"
+            );
+            ensure!(filter.minimum_pieces <= 32, "Minimum piece count cannot exceed 32");
+            ensure!(filter.maximum_ply.is_none_or(|maximum| maximum >= filter.minimum_ply), "Ply bounds are reversed");
+            
+            for source in &self.sources {
+                match source.format {
+                    Format::Bullet => ensure!(
+                        filter.minimum_ply == 0
+                            && filter.maximum_ply.is_none()
+                            && !filter.exclude_tactical
+                            && !filter.exclude_check,
+                        "These filters need game metadata unavailable in Bullet data"
+                    ),
+                    Format::Text => ensure!(
+                        !filter.exclude_tactical,
+                        "Tactical filtering needs the played move, unavailable in text data"
+                    ),
+                    _ => {},
+                }
+            }
+        }
+        Ok(())
     }
 }

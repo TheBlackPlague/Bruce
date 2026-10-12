@@ -1,70 +1,83 @@
-name: CI
+name: Rust
 
 on:
   push:
   pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  portable:
-    name: Rust checks (${{ matrix.os }})
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+
+  test:
     strategy:
-      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy
-      - name: Check lints without a GPU backend
-        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-      - name: Test formats, checkpoints, schedules and CLI
-        run: cargo test --locked --no-default-features
-      - name: Build optimized portable CLI
-        run: cargo build --release --locked --no-default-features
-      - name: Verify terminal resizing and interruption
-        if: runner.os == 'Linux'
-        run: python3 tests/terminal_progress.py target/release/bruce
-      - name: Install TensorBoard compatibility reader
-        if: runner.os == 'Linux'
-        run: python3 -m pip install 'tensorboard==2.20.0'
-      - name: Verify live and partial events with TensorBoard
-        if: runner.os == 'Linux'
-        run: cargo test --locked --no-default-features --test tensorboard -- --ignored
-      - name: Fetch pinned MantaRay reference headers
-        if: runner.os == 'Linux'
-        uses: actions/checkout@v4
-        with:
-          repository: TheBlackPlague/MantaRay
-          ref: 079959294e5c2b0c62e50f9222812d6f21014932
-          path: mantaray-reference
-      - name: Compare exported Aurora against actual MantaRay inference
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --no-default-features --all-targets
+      - name: Verify StockDory network compatibility
         if: runner.os == 'Linux'
         env:
-          MANTARAY_ROOT: ${{ github.workspace }}/mantaray-reference
-        run: cargo test --locked --no-default-features --test mantaray_compatibility -- --ignored
-
-  cuda-compile:
-    name: CUDA compile check (no device execution)
-    runs-on: ubuntu-latest
-    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
-    env:
-      CUDA_PATH: /usr/local/cuda
-    steps:
-      - name: Install build prerequisites
+          MANTARAY_ROOT: ${{ runner.temp }}/mantaray
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config
+          git init "$MANTARAY_ROOT"
+          git -C "$MANTARAY_ROOT" fetch --depth 1 https://github.com/TheBlackPlague/MantaRay.git 079959294e5c2b0c62e50f9222812d6f21014932
+          git -C "$MANTARAY_ROOT" checkout --detach FETCH_HEAD
+          cargo test --locked --no-default-features --test architecture -- --include-ignored
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Compile CUDA-enabled targets
-        run: cargo check --locked --all-targets
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --locked --no-default-features --all-targets --ignore-filename-regex '(^|/)tests/' --lcov --output-path coverage.lcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.lcov
+
+  backend-check:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: cuda
+          - os: ubuntu-latest
+            backend: rocm
+          - os: macos-latest
+            backend: metal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Type checks need SDK search paths but do not link or execute GPU code
+      - run: cargo clippy --locked --no-default-features --features ${{ matrix.backend }} --all-targets -- -D warnings
+        env:
+          CUDA_PATH: /usr
+          HIP_PATH: /usr

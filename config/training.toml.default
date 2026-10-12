@@ -1,0 +1,102 @@
+[schema]
+version = 1
+
+[config]
+name = "exp_name"
+arch = "Aurora"
+
+[random]
+seed = 42
+
+[hardware]
+gpu = 0
+
+[tensorboard]
+enabled = true
+path = "runs"
+
+[training]
+# Every superbatch contains 6104 batches
+superbatches = 400
+log_every = 32
+
+[training.checkpoint]
+# Paths are relative to the working directory, or absolute
+location = "checkpoints"
+type = "periodic"
+
+[training.checkpoint.periodic]
+superbatch = 30
+
+# For one scheduled checkpoint, use type = "single" and replace the table above
+# [training.checkpoint.single]
+# superbatch = 200
+
+[training.data.buffer]
+size_mb = 4096
+
+[training.data.threads]
+loader = 4
+mapper = 4
+
+[training.data.batch]
+size = 16384
+
+[training.data.source.0]
+format = "monty"
+path = "data/monty_value_00_06.bin"
+
+# [training.data.source.1]
+# format = "viri"
+# path = "data/viri_data_002_001.vf"
+# Text sources require separator, for example separator = " | "
+
+[training.data.filter]
+minimum_ply = 14
+# maximum_ply = 90
+minimum_pieces = 0
+# Evaluation limits use absolute magnitude, inclusive minimum and exclusive maximum
+minimum_eval = 100
+maximum_eval = 8000
+exclude_tactical = true
+exclude_check = true
+
+[training.optimizer]
+minimum_weight = -1.98
+maximum_weight = 1.98
+
+[training.optimizer.adamw]
+decay = 0.01
+beta1 = 0.9
+beta2 = 0.999
+
+[training.lr.0]
+superbatch_range = [1, 270]
+type = "step"
+
+[training.lr.0.step]
+gamma = 0.3
+start = 0.001
+size = 30
+
+[training.lr.1]
+superbatch_range = [271, 400]
+type = "step"
+
+[training.lr.1.step]
+gamma = 0.3
+start = 0.0001
+size = 20
+
+[training.wdl.0]
+superbatch_range = [1, 400]
+type = "constant"
+
+[training.wdl.0.constant]
+value = 0.0
+
+# Schedule indexes run from 0 to 99, and ranges cover training without gaps
+# Step counts and warmup restart at the beginning of each phase
+# Linear, cosine and exponential LR use initial and final_value, with optional final_superbatch
+# Linear WDL uses start and end
+# Warmup uses batches and an inner schedule table with its own type and parameters

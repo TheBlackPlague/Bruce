@@ -1,19 +1,11 @@
-#[cfg(any(
-    all(feature = "cuda", feature = "rocm"),
-    all(feature = "cuda", feature = "metal"),
-    all(feature = "rocm", feature = "metal")
-))]
-compile_error!("Enable exactly one GPU backend: cuda, rocm, or metal");
-
+pub mod analyze;
 pub mod architecture;
 pub mod checkpoint;
 pub mod config;
 pub mod convert;
 pub mod data;
-pub mod events;
+pub mod report;
 pub mod schedule;
-pub mod training;
-pub mod ui;
+pub mod train;
 
-pub mod progress;
-pub mod tensorboard;
+pub const BULLET_REVISION: &str = "1896c0884c7ededb1868068bbf5583d1726b37f6";

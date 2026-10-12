@@ -1,175 +1,162 @@
 use std::{
+    fs::{self, File},
+    io::Write,
     path::PathBuf,
-    process::{Command as ProcessCommand, ExitCode},
+    process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bruce::{
-    config::Config,
-    convert::{self, ConvertOptions},
-    data,
-    events::{Event, Reporter},
-    tensorboard::TensorBoard,
-    training, ui,
+    analyze,
+    architecture::Architecture,
+    config::{Config, DataSource},
+    convert,
+    data::Format,
+    train,
 };
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "bruce",
-    version,
-    about = "🦈 Bruce — Neural Network Trainer Interface for StockDory",
-    styles = cli_styles()
-)]
-struct Cli {
-    /// Disable live line updates (also automatic for redirected output and CI).
+#[command(name = "bruce", version, about = "Neural Network Training Interface & Tools for StockDory")]
+struct Cli
+{
+    /// Print progress without live updates
     #[arg(long, global = true)]
     plain: bool,
-
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Command
+{
+    /// Train a network or check a training configuration
     Train(TrainOptions),
-
-    Check(CheckOptions),
-
-    Convert(ConvertOptions),
-
-    #[command(name = "__worker", hide = true)]
-    Worker {
-        #[command(subcommand)]
-        command: WorkCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum WorkCommand {
-    Train(TrainOptions),
-    Check(CheckOptions),
-    Convert(ConvertOptions),
+    /// Convert a dataset
+    Convert(convert::Options),
+    /// Analyze a dataset and optional network checkpoint
+    Analyze(AnalyzeOptions),
 }
 
 #[derive(Args)]
-struct TrainOptions {
+struct TrainOptions
+{
     #[arg(short, long, default_value = "config/training.toml")]
     config: PathBuf,
-
-    #[arg(long)]
+    #[arg(long, conflicts_with = "check")]
     resume: Option<PathBuf>,
-
-    #[arg(long, default_value = "runs")]
-    tensorboard_dir: PathBuf,
+    /// Check the configuration and datasets without training
+    #[arg(long)]
+    check: bool,
+    /// Override the TensorBoard output directory and enable reporting
+    #[arg(long)]
+    tensorboard_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
-struct CheckOptions {
-    #[arg(short, long, default_value = "config/training.toml")]
-    config: PathBuf,
+struct AnalyzeOptions
+{
+    #[arg(long, value_enum)]
+    format: Format,
+    #[arg(long)]
+    input: PathBuf,
+    /// Separator used by text records
+    #[arg(long)]
+    separator: Option<String>,
+    /// Native Bruce checkpoint to evaluate
+    #[arg(long)]
+    network: Option<PathBuf>,
+    #[arg(long, value_enum, requires = "network")]
+    arch: Option<Architecture>,
+    #[arg(long, default_value_t = 0)]
+    gpu: i32,
+    /// Maximum positions to analyze
+    #[arg(long)]
+    limit: Option<u64>,
+    /// Save the full report as JSON
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
-fn cli_styles() -> clap::builder::Styles {
-    use clap::builder::styling::RgbColor;
-    clap::builder::Styles::styled()
-        .header     (RgbColor(227, 195, 139).on_default().bold())
-        .usage      (RgbColor(227, 195, 139).on_default().bold())
-        .literal    (RgbColor( 69, 202, 255).on_default()       )
-        .placeholder(RgbColor(173, 176, 178).on_default()       )
-        .error      (RgbColor(255, 117, 138).on_default().bold())
-        .valid      (RgbColor( 85, 220, 133).on_default()       )
-        .invalid    (RgbColor(255, 117, 138).on_default()       )
-}
+fn main() -> ExitCode
+{
+    std::panic::set_hook(Box::new(|_| eprintln!("Bruce: An operation failed unexpectedly")));
 
-fn main() -> ExitCode {
-    match execute(Cli::parse()) {
+    match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Bruce: {error:#}");
+            eprintln!("Bruce: {error}");
             ExitCode::FAILURE
-        }
+        },
     }
 }
 
-fn execute(cli: Cli) -> Result<()> {
-    if let Command::Worker { command } = cli.command {
-        let reporter = Reporter::new();
+fn run(cli: Cli) -> Result<()>
+{
+    match cli.command {
+        Command::Train(options) => {
+            let mut config = Config::load(&options.config)?;
 
-        return match command {
-            WorkCommand::Train(options) => {
-                training::run(Config::load(&options.config)?, options.resume, reporter)
+            if let Some(path) = options.tensorboard_dir {
+                config.tensorboard.enabled = true;
+                config.tensorboard.path = path;
             }
 
-            WorkCommand::Check(options) => {
-                reporter.emit(Event::Phase {
-                    name: "Checking configuration".into(),
-                    completed: 0,
-                    total: None,
-                });
+            if options.check {
+                logged("Checking configuration and datasets", || {
+                    train::check(&config)?;
+                    Ok("Configuration and datasets checked".into())
+                })
+            } else {
+                train::run(config, options.resume, cli.plain)
+            }
+        },
 
-                let config = Config::load(&options.config)?;
-                data::validate(&config.data, &reporter)?;
+        Command::Convert(options) => logged("Converting dataset", || {
+            let summary = convert::run(&options, cli.plain)?;
+            Ok(summary.to_string())
+        }),
 
-                reporter.emit(Event::Note {
-                    message: config.data.resume_note().to_string(),
-                });
+        Command::Analyze(options) => logged("Analyzing dataset", || {
+            let report = analyze::run(&analyze::Options {
+                source: DataSource { format: options.format, path: options.input, separator: options.separator },
+                network: options.network,
+                architecture: options.arch,
+                gpu: options.gpu,
+                limit: options.limit,
+            })?;
 
-                reporter.emit(Event::Note {
-                    message: "Configuration and dataset preflight passed.".into(),
-                });
-
-                reporter.emit(Event::Finished);
-
-                Ok(())
+            if let Some(path) = options.output {
+                report.write(&path)?;
             }
 
-            WorkCommand::Convert(options) => convert::convert(&options, &reporter),
-        };
+            Ok(report.summary())
+        }),
     }
+}
 
-    let training_config = match &cli.command {
-        Command::Train(options) => Some(Config::load(&options.config)?),
-        _ => None,
-    };
+fn logged(label: &str, operation: impl FnOnce() -> Result<String>) -> Result<()>
+{
+    fs::create_dir_all("logs")?;
 
-    let heading = match &cli.command {
-        Command::Train  (   _   ) => format!("Training {}", training_config.as_ref().unwrap().name),
-        Command::Check  (   _   ) => "Checking configuration and datasets".into(),
-        Command::Convert(options) => format!(
-            "Converting {} → {:?}\nInput:  {}\nOutput: {}",
-            options.from.label(),
-            options.to,
-            options.input.display(),
-            options.output.display()
-        ),
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let mut log = File::create_new(format!("logs/bruce-{timestamp}-{}.log", std::process::id()))?;
 
-        Command::Worker { .. } => unreachable!(),
-    };
+    writeln!(log, "{label}")?;
+    log.flush()?;
 
-    let tensorboard = match &cli.command {
-        Command::Train(options) => Some(TensorBoard::start(
-            &options.tensorboard_dir,
-            &training_config.as_ref().unwrap().name,
-        )?),
-        _ => None,
-    };
+    eprintln!("{label}");
 
-    let log_name = match &training_config {
-        Some(config) => format!("{}.log", config.name),
-        None => {
-            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-            format!("bruce-{stamp}.log")
-        }
-    };
-
-    let log_path = std::env::current_dir()?.join("logs").join(log_name);
-
-    let mut child = ProcessCommand::new(
-        std::env::current_exe().context("Locating Bruce executable")?
-    );
-    child.arg("__worker").args(std::env::args_os().skip(1));
-
-    ui::run_child(child, cli.plain, &log_path, &heading, tensorboard)
+    match operation() {
+        Ok(summary) => {
+            writeln!(log, "{summary}")?;
+            println!("{summary}");
+            Ok(())
+        },
+        Err(error) => {
+            let _ = writeln!(log, "{error}");
+            Err(error)
+        },
+    }
 }

@@ -110,3 +110,7 @@ rustc-ice-*.txt
 /logs/
 /runs/
 *.nnue
+
+# Local training configuration
+/config/training.toml
+/coverage/
