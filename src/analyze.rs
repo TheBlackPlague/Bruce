@@ -152,24 +152,13 @@ pub fn run(options: &Options) -> Result<Report>
         }
 
         if batch.len() == BATCH_SIZE {
-            evaluate_batch(evaluator.as_mut(), &batch, &mut report)?;
-            batch.clear();
+            evaluate_batch(evaluator.as_mut(), &mut batch, &mut report)?;
         }
 
         Ok(options.limit.is_some_and(|limit| report.count == limit))
     })?;
 
-    if !batch.is_empty() {
-        let length = batch.len();
-
-        batch.resize(BATCH_SIZE, batch[0]);
-
-        let values = evaluator.as_mut().expect("Network batch requires an evaluator").evaluate(&batch)?;
-
-        for (board, value) in batch.iter().zip(values).take(length) {
-            report.predict(*board, value)?;
-        }
-    }
+    evaluate_batch(evaluator.as_mut(), &mut batch, &mut report)?;
 
     ensure!(report.count > 0, "Dataset contains no positions");
     Ok(report.finish(options.limit))
@@ -177,14 +166,21 @@ pub fn run(options: &Options) -> Result<Report>
 
 fn evaluate_batch<G: Gpu>(
     evaluator: Option<&mut Evaluator<G>>,
-    batch: &[ChessBoard],
+    batch: &mut Vec<ChessBoard>,
     report: &mut Accumulator,
 ) -> Result<()>
 {
-    if let Some(evaluator) = evaluator {
-        for (board, value) in batch.iter().zip(evaluator.evaluate(batch)?) {
+    if let Some(evaluator) = evaluator
+        && !batch.is_empty()
+    {
+        let length = batch.len();
+        batch.resize(BATCH_SIZE, batch[0]);
+
+        for (board, value) in batch.iter().zip(evaluator.evaluate(batch)?).take(length) {
             report.predict(*board, value)?;
         }
+
+        batch.clear();
     }
     Ok(())
 }
@@ -495,7 +491,7 @@ impl<G: Gpu> Evaluator<G>
 
         let values = self.output.to_host().map_err(|_| anyhow::anyhow!("Cannot read network output"))?;
         ensure!(values.f32().len() == batch.len(), "Network returned the wrong number of scores");
-        
+
         Ok(values.f32().to_vec())
     }
 }

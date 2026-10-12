@@ -1,0 +1,11 @@
+[training.wdl.0]
+superbatch_range=[1,200]
+type='constant'
+[training.wdl.0.constant]
+value=0.0
+[training.wdl.1]
+superbatch_range=[201,400]
+type='linear'
+[training.wdl.1.linear]
+start=0.1
+end=1.0

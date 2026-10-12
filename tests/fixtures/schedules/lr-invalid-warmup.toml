@@ -1,0 +1,7 @@
+type='warmup'
+[training.lr.0.warmup]
+batches=6105
+[training.lr.0.warmup.inner]
+type='constant'
+[training.lr.0.warmup.inner.constant]
+value=0.001

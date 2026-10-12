@@ -56,14 +56,14 @@ fn tensorboard_sessions_preserve_steps_tags_and_valid_records()
         while cursor < bytes.len() {
             let length = &bytes[cursor..cursor + 8];
             assert_eq!(checksum(length), u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()));
-            
+
             let size = u64::from_le_bytes(length.try_into().unwrap()) as usize;
             let data = &bytes[cursor + 12..cursor + 12 + size];
             assert_eq!(
                 checksum(data),
                 u32::from_le_bytes(bytes[cursor + 12 + size..cursor + 16 + size].try_into().unwrap())
             );
-            
+
             events.push(Event::decode(data).unwrap());
             cursor += size + 16;
         }

@@ -16,9 +16,9 @@ use bullet_lib::game::formats::{
         self, TrainingDataEntry,
         chess::{
             coords::Square,
+            r#move::{Move as SfMove, MoveType},
             piece::Piece,
             piecetype::PieceType,
-            r#move::{Move as SfMove, MoveType},
         },
     },
     viriformat::{
@@ -26,7 +26,7 @@ use bullet_lib::game::formats::{
             CHESS960,
             board::{Board, DrawType, GameOutcome, WinType, movegen::MoveList},
             chessmove::Move,
-        }, 
+        },
         dataformat::Game,
     },
 };
@@ -132,9 +132,31 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
         }
 
         if options.from == Format::Monty && options.to == Format::Viri {
-            summary.positions = monty_to_viri(options, &mut writer, threads, &progress)?;
+            summary.positions = convert_games(
+                options,
+                &mut writer,
+                threads,
+                &progress,
+                |reader| {
+                    let game = MontyValueFormat::deserialise_from(reader, Vec::new())?;
+                    let positions = game.moves.len();
+                    Ok((game, positions))
+                },
+                encode_monty_games,
+            )?;
         } else if options.from == Format::Viri && options.to == Format::Monty {
-            summary.positions = viri_to_monty(options, &mut writer, threads, &progress)?;
+            summary.positions = convert_games(
+                options,
+                &mut writer,
+                threads,
+                &progress,
+                |reader| {
+                    let game = Game::deserialise_from(reader, Vec::new())?;
+                    let positions = game.moves.len();
+                    Ok((game, positions))
+                },
+                encode_viri_games,
+            )?;
         } else {
             let mut records = Vec::with_capacity(8192);
 
@@ -397,11 +419,13 @@ fn find_monty_move(
     found.context("Could not convert the played move")
 }
 
-fn monty_to_viri(
+fn convert_games<T: Sync>(
     options: &Options,
     writer: &mut impl Write,
     threads: usize,
     progress: &indicatif::ProgressBar,
+    decode: impl Fn(&mut BufReader<File>) -> Result<(T, usize)>,
+    encode: impl Fn(&[T]) -> Result<Vec<u8>> + Sync,
 ) -> Result<u64>
 {
     let mut reader = BufReader::new(File::open(&options.input)?);
@@ -409,18 +433,18 @@ fn monty_to_viri(
 
     let mut count = 0;
     while !reader.fill_buf()?.is_empty() {
-        let game = MontyValueFormat::deserialise_from(&mut reader, Vec::new())?;
-        count += game.moves.len() as u64;
+        let (game, positions) = decode(&mut reader)?;
+        count += positions as u64;
         games.push(game);
 
         if games.len() == threads * 64 {
-            write_parallel(&games, threads, encode_monty_games, writer)?;
+            write_parallel(&games, threads, &encode, writer)?;
             games.clear();
             progress.set_message(format!("{count} positions"));
         }
     }
 
-    write_parallel(&games, threads, encode_monty_games, writer)?;
+    write_parallel(&games, threads, &encode, writer)?;
     ensure!(count > 0, "No positions could be converted");
 
     Ok(count)
@@ -446,35 +470,6 @@ fn encode_monty_games(games: &[MontyValueFormat]) -> Result<Vec<u8>>
     }
 
     Ok(bytes)
-}
-
-fn viri_to_monty(
-    options: &Options,
-    writer: &mut impl Write,
-    threads: usize,
-    progress: &indicatif::ProgressBar,
-) -> Result<u64>
-{
-    let mut reader = BufReader::new(File::open(&options.input)?);
-    let mut games = Vec::with_capacity(threads * 64);
-
-    let mut count = 0;
-    while !reader.fill_buf()?.is_empty() {
-        let game = Game::deserialise_from(&mut reader, Vec::new())?;
-        count += game.moves.len() as u64;
-        games.push(game);
-
-        if games.len() == threads * 64 {
-            write_parallel(&games, threads, encode_viri_games, writer)?;
-            games.clear();
-            progress.set_message(format!("{count} positions"));
-        }
-    }
-
-    write_parallel(&games, threads, encode_viri_games, writer)?;
-    ensure!(count > 0, "No positions could be converted");
-
-    Ok(count)
 }
 
 fn encode_viri_games(games: &[Game]) -> Result<Vec<u8>>

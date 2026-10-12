@@ -293,11 +293,11 @@ impl Config
     {
         let file: FileConfig = toml::from_str(source).context("Invalid training configuration")?;
         ensure!(file.schema.version == 1, "Unsupported configuration version");
-        
+
         let schedules = serde_json::json!({"learning_rate": file.training.lr, "wdl": file.training.wdl});
         let training = file.training;
         ensure!(training.superbatches > 0 && training.superbatches < usize::MAX, "Training counts must be positive");
-        
+
         let checkpoint_config = match training.checkpoint {
             Checkpoint::Periodic { location, periodic } => {
                 CheckpointConfig { location, policy: CheckpointPolicy::Periodic { superbatch: periodic.superbatch } }
@@ -306,10 +306,10 @@ impl Config
                 CheckpointConfig { location, policy: CheckpointPolicy::Single { superbatch: single.superbatch } }
             },
         };
-        
+
         let data = training.data;
         let optimizer = training.optimizer;
-        
+
         let config = Self {
             name: file.config.name,
             architecture: file.config.arch,
@@ -341,7 +341,7 @@ impl Config
             schedules,
         };
         config.validate()?;
-        
+
         Ok(config)
     }
 
@@ -368,11 +368,11 @@ impl Config
                 && self.name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
             "Name must use 1 to 100 letters, numbers, '-' or '_'"
         );
-        
+
         self.architecture.parse::<Architecture>()?;
-        
+
         ensure!(self.device >= 0, "GPU number cannot be negative");
-        
+
         ensure!(
             self.training.superbatches > 0 && self.training.superbatches < usize::MAX && self.training.log_every > 0,
             "Training counts must be positive"
@@ -382,7 +382,7 @@ impl Config
             .checked_mul(BATCHES_PER_SUPERBATCH)
             .and_then(|count| count.checked_mul(self.training.superbatches))
             .context("Training is too large")?;
-        
+
         ensure!(!self.training.checkpoint.location.as_os_str().is_empty(), "Checkpoint location cannot be empty");
         match self.training.checkpoint.policy {
             CheckpointPolicy::Periodic { superbatch } => {
@@ -395,14 +395,14 @@ impl Config
                 );
             },
         }
-        
+
         ensure!(
             !self.tensorboard.enabled || !self.tensorboard.path.as_os_str().is_empty(),
             "TensorBoard path cannot be empty"
         );
-        
+
         self.data.validate()?;
-        
+
         let optimizer = &self.optimizer;
         ensure!(optimizer.decay.is_finite() && optimizer.decay >= 0.0, "Weight decay must be finite and nonnegative");
         ensure!(
@@ -417,7 +417,7 @@ impl Config
                 && optimizer.maximum_weight <= 2.0,
             "Weight limits must be ordered within [-2, 2]"
         );
-        
+
         Ok(())
     }
 }
@@ -427,14 +427,15 @@ impl DataConfig
     pub fn validate(&self) -> Result<()>
     {
         ensure!(self.batch_size > 0, "Batch size must be positive");
+        self.batch_size.checked_mul(BATCHES_PER_SUPERBATCH).context("Batch size is too large")?;
         ensure!((1..=1_048_576).contains(&self.buffer_size_mb), "Buffer size must be between 1 and 1048576 MB");
         self.buffer_size_mb.checked_mul(1024 * 1024).context("Buffer is too large")?;
-        
+
         ensure!(
             (1..=256).contains(&self.loader_threads) && self.mapping_threads > 0,
             "Loader and mapper counts must be positive; at most 256 loaders are supported"
         );
-        
+
         ensure!(!self.sources.is_empty(), "At least one data source is required");
 
         for source in &self.sources {
@@ -442,7 +443,7 @@ impl DataConfig
                 !source.path.as_os_str().is_empty() && source.path.to_str().is_some(),
                 "Dataset path must be nonempty UTF-8"
             );
-            
+
             match (&source.format, &source.separator) {
                 (Format::Text, Some(separator)) => ensure!(
                     !separator.is_empty() && !separator.contains(['\n', '\r']),
@@ -461,7 +462,7 @@ impl DataConfig
             );
             ensure!(filter.minimum_pieces <= 32, "Minimum piece count cannot exceed 32");
             ensure!(filter.maximum_ply.is_none_or(|maximum| maximum >= filter.minimum_ply), "Ply bounds are reversed");
-            
+
             for source in &self.sources {
                 match source.format {
                     Format::Bullet => ensure!(

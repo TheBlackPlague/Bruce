@@ -13,7 +13,7 @@ fn example_matches_requested_layout()
     assert_eq!(config.training.superbatches, 400);
     assert_eq!(config.data.batch_size, 16384);
     assert_eq!(config.data.mapping_threads, 4);
-    assert_eq!(config.data.filter.unwrap().minimum_eval, 100);
+    assert_eq!(config.data.filter.unwrap().minimum_eval, 0);
     assert!(config.training.checkpoint.policy.should_save(30));
     assert!(!config.training.checkpoint.policy.should_save(31));
 }
@@ -41,8 +41,8 @@ fn rejects_unknown_fields_and_invalid_values()
         EXAMPLE.replace("mapper = 4", "mapper = 256"),
         EXAMPLE.replace("size = 16384", "size = 0"),
         EXAMPLE.replace("beta2 = 0.999", "beta2 = nan"),
-        EXAMPLE.replace("minimum_eval = 100", "minimum_eval = 8000"),
-        EXAMPLE.replace("minimum_pieces = 0", "minimum_pieces = 33"),
+        EXAMPLE.replace("# minimum_eval = 100", "minimum_eval = 8000"),
+        EXAMPLE.replace("# minimum_pieces = 0", "minimum_pieces = 33"),
         EXAMPLE.replace("arch = \"Aurora\"", "arch = \"Unknown\""),
         EXAMPLE.replace("superbatch = 30", "superbatch = 0"),
     ] {
@@ -125,4 +125,12 @@ fn reporting_changes_do_not_invalidate_resume()
     config.tensorboard.path = PathBuf::from("another-directory");
     config.tensorboard.enabled = !config.tensorboard.enabled;
     assert_eq!(config.checkpoint_value(), before);
+}
+
+#[test]
+fn data_validation_rejects_overflowing_superbatch_size()
+{
+    let mut data = Config::from_toml(EXAMPLE).unwrap().data;
+    data.batch_size = usize::MAX / bruce::schedule::BATCHES_PER_SUPERBATCH + 1;
+    assert!(data.validate().is_err());
 }

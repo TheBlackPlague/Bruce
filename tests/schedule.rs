@@ -49,13 +49,8 @@ fn schedule_ranges_and_indexes_are_strict()
 fn decay_schedulers_match_bullet_at_boundaries()
 {
     for kind in ["linear", "cosine", "exponential"] {
-        let config = configured(
-            &format!(
-                "[training.lr.0]\nsuperbatch_range = [1,400]\ntype = '{kind}'\n[training.lr.0.{kind}]\ninitial = \
-                 0.001\nfinal_value = 0.00001\nfinal_superbatch = 200"
-            ),
-            CONSTANT_WDL,
-        );
+        let config =
+            configured(&include_str!("fixtures/schedules/lr-decay.toml").replace("linear", kind), CONSTANT_WDL);
         for superbatch in [1, 2, 100, 199, 200, 400] {
             let expected =
                 match kind {
@@ -74,15 +69,7 @@ fn decay_schedulers_match_bullet_at_boundaries()
 #[test]
 fn nested_sequence_and_warmup_delegate_to_bullet()
 {
-    let config = configured(
-        "[training.lr.0]\nsuperbatch_range=[1,400]\ntype='sequence'\n[training.lr.0.sequence]\\
-         nswitch_after=200\n[training.lr.0.sequence.first]\ntype='constant'\n[training.lr.0.sequence.first.constant]\\
-         nvalue=0.001\n[training.lr.0.sequence.second]\ntype='warmup'\\
-         n[training.lr.0.sequence.second.warmup]\nbatches=32\n[training.lr.0.sequence.second.warmup.inner]\ntype='\
-         constant'\n[training.lr.0.sequence.second.warmup.inner.constant]\\
-         nvalue=0.0001",
-        CONSTANT_WDL,
-    );
+    let config = configured(include_str!("fixtures/schedules/lr-sequence.toml"), CONSTANT_WDL);
     let reference = lr::Sequence {
         first: lr::ConstantLR { value: 0.001 },
         second: lr::Warmup { warmup_batches: 32, inner: lr::ConstantLR { value: 0.0001 } },
@@ -96,12 +83,7 @@ fn nested_sequence_and_warmup_delegate_to_bullet()
 #[test]
 fn wdl_linear_uses_phase_duration()
 {
-    let config = configured(
-        CONSTANT_LR,
-        "[training.wdl.0]\nsuperbatch_range=[1,200]\ntype='constant'\n[training.wdl.0.constant]\\
-         nvalue=0.0\n[training.wdl.1]\nsuperbatch_range=[201,400]\ntype='linear'\n[training.wdl.1.linear]\nstart=0.1\\
-         nend=1.0",
-    );
+    let config = configured(CONSTANT_LR, include_str!("fixtures/schedules/wdl-phases.toml"));
     let reference = wdl::LinearWDL { start: 0.1, end: 1.0 };
     assert_eq!(config.wdl.blend(0, 200, 400), 0.0);
     for superbatch in [201, 202, 300, 400] {
@@ -112,16 +94,7 @@ fn wdl_linear_uses_phase_duration()
 #[test]
 fn wdl_nested_sequence_and_warmup_match_bullet()
 {
-    let config = configured(
-        CONSTANT_LR,
-        "[training.wdl.0]\nsuperbatch_range=[1,400]\ntype='sequence'\n[training.wdl.0.sequence]\\
-         nswitch_after=200\n[training.wdl.0.sequence.first]\ntype='constant'\n[training.wdl.0.sequence.first.constant]\\
-         \
-         nvalue=0.0\n[training.wdl.0.sequence.second]\ntype='warmup'\\
-         n[training.wdl.0.sequence.second.warmup]\nbatches=32\n[training.wdl.0.sequence.second.warmup.inner]\ntype='\
-         linear'\n[training.wdl.0.sequence.second.warmup.inner.linear]\\
-         nstart=0.5\nend=1.0",
-    );
+    let config = configured(CONSTANT_LR, include_str!("fixtures/schedules/wdl-sequence.toml"));
     let reference = wdl::Sequence {
         first: wdl::ConstantWDL { value: 0.0 },
         second: wdl::Warmup { warmup_batches: 32, inner: wdl::LinearWDL { start: 0.5, end: 1.0 } },
@@ -140,18 +113,13 @@ fn rejects_numeric_schedule_overflow_and_underflow()
         "type='step'\n[training.lr.0.step]\nstart=0.001\ngamma=0.001\nsize=1",
         "type='exponential'\n[training.lr.0.exponential]\ninitial=1e-35\nfinal_value=1e35",
         "type='exponential'\n[training.lr.0.exponential]\ninitial=1e35\nfinal_value=1e-35",
-        "type='warmup'\n[training.lr.0.warmup]\nbatches=6105\n[training.lr.0.warmup.inner]\ntype='constant'\\
-         n[training.lr.0.warmup.inner.constant]\nvalue=0.001",
+        include_str!("fixtures/schedules/lr-invalid-warmup.toml"),
     ] {
         let source = format!("{prefix}\n[training.lr.0]\nsuperbatch_range=[1,400]\n{parameters}\n{CONSTANT_WDL}");
         assert!(Config::from_toml(&source).is_err());
     }
 
-    let source = format!(
-        "{}\n[training.lr.0]\nsuperbatch_range=[1,2147483650]\ntype='step'\n[training.lr.0.step]\\
-         nstart=0.001\ngamma=1.0\nsize=1\n{}",
-        prefix.replace("superbatches = 400", "superbatches = 2147483650"),
-        CONSTANT_WDL.replace("400", "2147483650")
-    );
+    let lr = include_str!("fixtures/schedules/lr-step.toml");
+    let source = format!("{prefix}\n{lr}\n{CONSTANT_WDL}").replace("400", "2147483650");
     assert!(Config::from_toml(&source).is_err());
 }

@@ -1,0 +1,8 @@
+[training.lr.0]
+superbatch_range = [1, 400]
+type = 'step'
+
+[training.lr.0.step]
+start = 0.001
+gamma = 1.0
+size = 1

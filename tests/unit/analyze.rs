@@ -10,7 +10,7 @@ fn signed_score_distribution_and_percentiles_are_exact()
         stats.observe(board(score, result));
     }
     let report = stats.finish(None);
-    
+
     assert_eq!(report.score_distribution, BTreeMap::from([(-100, 2), (0, 1), (300, 1)]));
     assert_eq!(report.scores.mean_cp, 25.0);
     assert!((report.scores.standard_deviation_cp - 26875.0_f64.sqrt()).abs() < 1e-10);
@@ -31,7 +31,7 @@ fn network_error_and_calibration_use_stm_scores()
     }
     let report = stats.finish(None);
     let network = report.network.unwrap();
-    
+
     assert_eq!(network.overall.bias_cp, 0.0);
     assert_eq!(network.overall.mean_absolute_error_cp, 100.0);
     assert_eq!(network.overall.root_mean_squared_error_cp, 100.0);
@@ -48,7 +48,7 @@ fn score_buckets_floor_negative_values_and_nonfinite_outputs_fail()
 {
     let mut stats = Accumulator::new(Some(Architecture::Starshard));
     stats.predict(board(-1, 1), 0.0).unwrap();
-    
+
     assert!(stats.network.as_ref().unwrap().by_teacher_score_cp.contains_key(&-100));
     assert!(stats.predict(board(0, 1), f32::NAN).is_err());
     assert!(stats.predict(board(0, 1), f32::INFINITY).is_err());
@@ -64,12 +64,12 @@ fn report_does_not_overwrite_existing_files()
     let report = stats.finish(Some(1));
     report.write(&path).unwrap();
     let first = std::fs::read(&path).unwrap();
-    
+
     assert!(report.write(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), first);
-    
+
     let decoded: serde_json::Value = serde_json::from_slice(&first).unwrap();
-    
+
     assert_eq!(decoded["limit_reached"], true);
     assert_eq!(decoded["score_distribution"]["0"], 1);
 }

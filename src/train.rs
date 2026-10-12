@@ -31,7 +31,6 @@ pub type Trainer = Optimiser<ExecutionContext, AdamW<ExecutionContext>>;
 pub fn check(config: &Config) -> Result<()>
 {
     config.validate()?;
-    let _ = config.architecture.parse::<Architecture>()?;
     data::validate(&config.data)?;
     Ok(())
 }
@@ -49,10 +48,6 @@ pub fn run(config: Config, resume: Option<PathBuf>, plain: bool) -> Result<()>
     let reader = DatasetReader::new(&config.data, config.seed, stop.clone())?;
     let checkpoints = Checkpoints::new(&config)?;
     let completed = resume.as_ref().map(|path| checkpoints.inspect(path)).transpose()?.unwrap_or(0);
-
-    if completed >= config.training.superbatches {
-        bail!("This checkpoint has already finished the configured training");
-    }
 
     for superbatch in completed + 1..=config.training.superbatches {
         if should_save(&config, superbatch) {

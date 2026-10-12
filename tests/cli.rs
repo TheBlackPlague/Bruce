@@ -26,7 +26,7 @@ fn exposes_three_workloads_and_resume()
 fn rejects_conflicting_preflight_and_resume()
 {
     let output = bruce(&["train", "--check", "--resume", "checkpoint"]);
-    
+
     assert!(!output.status.success());
     assert!(String::from_utf8(output.stderr).unwrap().contains("cannot be used"));
 }
@@ -37,11 +37,11 @@ fn reports_missing_configuration_without_a_panic()
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing.toml");
     let output = bruce(&["train", "--check", "--config", missing.to_str().unwrap()]);
-    
+
     assert!(!output.status.success());
-    
+
     let text = String::from_utf8(output.stderr).unwrap();
-    
+
     assert!(text.starts_with("Bruce: "));
     assert!(!text.contains("panicked"));
 }
@@ -55,7 +55,7 @@ fn conversion_and_analysis_commands_write_reports_and_session_logs()
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1;125;0.5\n",
     )
     .unwrap();
-    
+
     let convert = Command::new(env!("CARGO_BIN_EXE_bruce"))
         .current_dir(directory.path())
         .args([
@@ -74,14 +74,14 @@ fn conversion_and_analysis_commands_write_reports_and_session_logs()
         .output()
         .unwrap();
     assert!(convert.status.success(), "{}", String::from_utf8_lossy(&convert.stderr));
-    
+
     let analyze = Command::new(env!("CARGO_BIN_EXE_bruce"))
         .current_dir(directory.path())
         .args(["analyze", "--format", "bullet", "--input", "output.bullet", "--output", "report.json"])
         .output()
         .unwrap();
     assert!(analyze.status.success(), "{}", String::from_utf8_lossy(&analyze.stderr));
-    
+
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.path().join("report.json")).unwrap()).unwrap();
     assert_eq!(report["positions"], 1);

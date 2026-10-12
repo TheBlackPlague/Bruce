@@ -185,7 +185,10 @@ fn cancellation_stops_on_a_complete_superbatch()
     assert_eq!(count, 6104);
     assert_eq!(reader.error(), None);
 
+    fs::remove_file(&path).unwrap();
+    
     reader.read_chunks(0, |_| panic!("Stopped reader emitted a batch"));
+    assert_eq!(reader.error(), None);
 }
 
 #[test]
@@ -268,7 +271,7 @@ fn sf_conversion_preserves_minimum_score_without_overflow()
 {
     use bullet_lib::game::formats::sfbinpack::{
         CompressedTrainingDataEntryWriter, TrainingDataEntry,
-        chess::{coords::Square, position::Position, r#move::Move},
+        chess::{coords::Square, r#move::Move, position::Position},
     };
 
     let directory = TempDir::new().unwrap();

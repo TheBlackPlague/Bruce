@@ -1,0 +1,8 @@
+[training.lr.0]
+superbatch_range = [1, 400]
+type = 'linear'
+
+[training.lr.0.linear]
+initial = 0.001
+final_value = 0.00001
+final_superbatch = 200

@@ -50,11 +50,29 @@ struct Manifest
     files: BTreeMap<String, DigestEntry>,
 }
 
+impl Manifest
+{
+    fn read(path: &Path, architecture: Architecture) -> Result<Self>
+    {
+        let manifest: Self =
+            serde_json::from_reader(File::open(path.join("checkpoint.json")).context("Cannot read checkpoint")?)
+                .context("Invalid checkpoint")?;
+
+        ensure!(manifest.version == 1, "Unsupported checkpoint version");
+        ensure!(manifest.bullet_revision == BULLET_REVISION, "Checkpoint uses a different Bullet version");
+        ensure!(
+            manifest.architecture.eq_ignore_ascii_case(architecture.name()),
+            "Checkpoint uses a different architecture"
+        );
+        Ok(manifest)
+    }
+}
+
 pub struct Checkpoints
 {
     directory: PathBuf,
     name: String,
-    architecture: String,
+    architecture: Architecture,
     final_superbatch: usize,
     configuration: serde_json::Value,
     datasets: Vec<Dataset>,
@@ -69,7 +87,7 @@ impl Checkpoints
         Ok(Self {
             directory: config.training.checkpoint.location.clone(),
             name: config.name.clone(),
-            architecture: config.architecture.parse::<Architecture>()?.name().to_owned(),
+            architecture: config.architecture.parse()?,
             final_superbatch: config.training.superbatches,
             configuration: config.checkpoint_value(),
             datasets,
@@ -78,18 +96,14 @@ impl Checkpoints
 
     pub fn inspect(&self, path: &Path) -> Result<usize>
     {
-        let manifest: Manifest =
-            serde_json::from_reader(File::open(path.join("checkpoint.json")).context("Cannot read checkpoint")?)
-                .context("Invalid checkpoint")?;
+        let manifest = Manifest::read(path, self.architecture)?;
 
-        ensure!(manifest.version == 1, "Unsupported checkpoint version");
-        ensure!(manifest.bullet_revision == BULLET_REVISION, "Checkpoint uses a different Bullet version");
         ensure!(manifest.configuration == self.configuration, "Configuration differs from the checkpoint");
         ensure!(manifest.datasets == self.datasets, "Datasets differ from the checkpoint");
         ensure!(manifest.completed_superbatch > 0, "Checkpoint has no completed training");
         ensure!(manifest.completed_superbatch < self.final_superbatch, "Training is already complete");
 
-        validate_files(path, &manifest, &self.architecture)?;
+        validate_files(path, &manifest, self.architecture)?;
         Ok(manifest.completed_superbatch)
     }
 
@@ -122,9 +136,9 @@ impl Checkpoints
 
         let temporary = tempfile::Builder::new().prefix(".checkpoint-").tempdir_in(&self.directory)?;
         let state = temporary.path().join("optimiser_state");
-        
+
         fs::create_dir(&state)?;
-        
+
         catch_unwind(AssertUnwindSafe(|| {
             optimiser
                 .write_to_checkpoint(state.to_str().context("Checkpoint path must be UTF-8")?)
@@ -132,11 +146,11 @@ impl Checkpoints
         }))
         .map_err(|_| anyhow::anyhow!("Cannot save optimizer"))??;
 
-        let bytes = optimiser
-            .cpu_weights()
-            .map_err(|error| anyhow::anyhow!("Cannot read network: {error:?}"))?
-            .to_quantised_buffer(format, true)
-            .context("Cannot export network")?;
+        let weights = optimiser.cpu_weights().map_err(|error| anyhow::anyhow!("Cannot read network: {error:?}"))?;
+        for name in STATE_FILES {
+            validate_state(&state.join(name), &weights)?;
+        }
+        let bytes = weights.to_quantised_buffer(format, true).context("Cannot export network")?;
         let hash = format!("{:x}", Sha256::digest(&bytes));
         let network = format!("{}-{}.nnue", self.architecture, &hash[..10]);
         fs::write(temporary.path().join(&network), bytes)?;
@@ -153,7 +167,7 @@ impl Checkpoints
         let manifest = Manifest {
             version: 1,
             bullet_revision: BULLET_REVISION.into(),
-            architecture: self.architecture.clone(),
+            architecture: self.architecture.name().into(),
             configuration: self.configuration.clone(),
             datasets: self.datasets.clone(),
             completed_superbatch: superbatch,
@@ -162,16 +176,16 @@ impl Checkpoints
         let mut file = File::create(temporary.path().join("checkpoint.json"))?;
         file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
         file.sync_all()?;
-        
+
         sync_directory(&state)?;
         sync_directory(temporary.path())?;
 
         self.check_destination(superbatch)?;
         let destination = self.destination(superbatch);
         fs::rename(temporary.path(), &destination).context("Cannot publish checkpoint")?;
-        
+
         sync_directory(&self.directory)?;
-        
+
         Ok(destination)
     }
 }
@@ -189,16 +203,14 @@ pub fn restore<G: Gpu, S: OptimiserState<G>>(optimiser: &mut Optimiser<G, S>, pa
 
 pub fn load_weights(path: &Path, architecture: Architecture) -> Result<ModelWeights>
 {
-    let manifest: Manifest =
-        serde_json::from_reader(File::open(path.join("checkpoint.json")).context("Cannot read checkpoint")?)
-            .context("Invalid checkpoint")?;
-    validate_files(path, &manifest, architecture.name())?;
+    let manifest = Manifest::read(path, architecture)?;
+    validate_files(path, &manifest, architecture)?;
 
     let mut weights = ModelWeights::zeroed(&architecture.definition());
     let file = File::open(path.join("optimiser_state/weights.bin"))?;
     catch_unwind(AssertUnwindSafe(|| weights.load_from(file)))
         .map_err(|_| anyhow::anyhow!("Invalid network weights"))??;
-    
+
     ensure!(
         weights.iter().all(|(_, value)| value.values.f32().iter().all(|value| value.is_finite())),
         "Network weights are incomplete or invalid"
@@ -206,25 +218,20 @@ pub fn load_weights(path: &Path, architecture: Architecture) -> Result<ModelWeig
     Ok(weights)
 }
 
-fn validate_files(path: &Path, manifest: &Manifest, architecture: &str) -> Result<()>
+fn validate_files(path: &Path, manifest: &Manifest, architecture: Architecture) -> Result<()>
 {
-    ensure!(manifest.version == 1, "Unsupported checkpoint version");
-    ensure!(manifest.bullet_revision == BULLET_REVISION, "Checkpoint uses a different Bullet version");
-    ensure!(manifest.architecture.eq_ignore_ascii_case(architecture), "Checkpoint uses a different architecture");
-    
     for name in STATE_FILES {
         ensure!(manifest.files.contains_key(&format!("optimiser_state/{name}")), "Checkpoint is incomplete");
     }
-    
+
     ensure!(
-        manifest
-            .files
-            .keys()
-            .any(|name| name.to_ascii_lowercase().starts_with(&format!("{}-", architecture.to_ascii_lowercase()))
-                && name.ends_with(".nnue")),
+        manifest.files.keys().any(|name| name
+            .to_ascii_lowercase()
+            .starts_with(&format!("{}-", architecture.name().to_ascii_lowercase()))
+            && name.ends_with(".nnue")),
         "Checkpoint has no exported network"
     );
-    
+
     for (name, expected) in &manifest.files {
         ensure!(
             Path::new(name).components().all(|part| matches!(part, Component::Normal(_))),
@@ -232,13 +239,12 @@ fn validate_files(path: &Path, manifest: &Manifest, architecture: &str) -> Resul
         );
         ensure!(digest(&path.join(name))? == *expected, "Checkpoint is incomplete or corrupted");
     }
-    
-    let architecture: Architecture = architecture.parse()?;
+
     let weights = ModelWeights::zeroed(&architecture.definition());
     for name in STATE_FILES {
         validate_state(&path.join("optimiser_state").join(name), &weights)?;
     }
-    
+
     Ok(())
 }
 
@@ -248,35 +254,35 @@ fn validate_state(path: &Path, weights: &ModelWeights) -> Result<()>
         weights.iter().map(|(name, value)| (name.as_str(), value.values.size())).collect();
     let size: usize =
         expected.iter().map(|(name, count)| name.len() + 1 + size_of::<usize>() + count * size_of::<f32>()).sum();
-    
+
     let file = File::open(path)?;
     ensure!(file.metadata()?.len() == size as u64, "Invalid checkpoint state");
-    
+
     let mut bytes = Vec::with_capacity(size);
     file.take(size as u64 + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() == size, "Invalid checkpoint state");
-    
+
     let mut remaining = bytes.as_slice();
     while !remaining.is_empty() {
         let end = remaining.iter().position(|byte| *byte == b'\n').context("Invalid checkpoint state")?;
-        
+
         let name = std::str::from_utf8(&remaining[..end]).context("Invalid checkpoint state")?;
         let count = expected.remove(name).context("Invalid checkpoint tensor")?;
-        
+
         remaining = &remaining[end + 1..];
         let length = remaining.get(..size_of::<usize>()).context("Invalid checkpoint state")?;
         ensure!(usize::from_le_bytes(length.try_into()?) == count, "Invalid checkpoint tensor size");
-        
+
         remaining = &remaining[size_of::<usize>()..];
         let values = remaining.get(..count * size_of::<f32>()).context("Invalid checkpoint state")?;
         ensure!(
             values.as_chunks::<4>().0.iter().all(|value| f32::from_le_bytes(*value).is_finite()),
             "Checkpoint contains invalid values"
         );
-        
+
         remaining = &remaining[values.len()..];
     }
-    
+
     ensure!(expected.is_empty(), "Checkpoint is missing tensors");
     Ok(())
 }
@@ -294,7 +300,7 @@ fn digest(path: &Path) -> Result<DigestEntry>
     let mut hash = Sha256::new();
     let mut length = 0;
     let mut buffer = [0u8; 65536];
-    
+
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -303,7 +309,7 @@ fn digest(path: &Path) -> Result<DigestEntry>
         hash.update(&buffer[..count]);
         length += count as u64;
     }
-    
+
     Ok(DigestEntry { length, sha256: format!("{:x}", hash.finalize()) })
 }
 
@@ -311,10 +317,10 @@ fn sync_directory(path: &Path) -> Result<()>
 {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
-    
+
     #[cfg(not(unix))]
     let _ = path;
-    
+
     Ok(())
 }
 

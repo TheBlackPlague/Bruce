@@ -78,10 +78,10 @@ impl<'de, T: DeserializeOwned> Deserialize<'de> for Phase<T>
             .as_object_mut()
             .and_then(|object| object.remove("superbatch_range"))
             .ok_or_else(|| D::Error::missing_field("superbatch_range"))?;
-        
+
         let superbatch_range = serde_json::from_value(range).map_err(D::Error::custom)?;
         let schedule = serde_json::from_value(value).map_err(D::Error::custom)?;
-        
+
         Ok(Self { superbatch_range, schedule })
     }
 }
@@ -215,11 +215,11 @@ fn phases<T>(entries: BTreeMap<String, Phase<T>>, duration: usize, label: &str) 
 {
     let entries = indexed(entries, label)?;
     ensure!(entries.len() <= 100, "{label} supports indexes from 0 to 99");
-    
+
     let mut next = 1;
     for phase in &entries {
         let [start, end] = phase.superbatch_range;
-        
+
         ensure!(
             start == next && end >= start && end <= duration,
             "{label} ranges must cover training without gaps or overlaps"
@@ -305,10 +305,10 @@ impl LrSpec
                     "Step needs a positive size and gamma in (0, 1]"
                 );
                 ensure!((duration - 1) / step.size <= i32::MAX as usize, "Step schedule is too long");
-                
+
                 let scheduler = lr::StepLR { start: step.start, gamma: step.gamma, step: step.size };
                 positive(scheduler.lr(0, duration))?;
-                
+
                 LrSchedule::new(scheduler)
             },
             Self::Linear { linear: decay } => {

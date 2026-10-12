@@ -29,7 +29,10 @@ use clap::ValueEnum;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{DataConfig, DataSource, Filter};
+use crate::{
+    config::{DataConfig, DataSource, Filter},
+    schedule::BATCHES_PER_SUPERBATCH,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -69,13 +72,18 @@ impl Record
 fn accepted(record: &Record, filter: Option<&Filter>) -> bool
 {
     let Some(filter) = filter else { return true };
-    let score = u32::from(record.board.score.unsigned_abs());
-    score >= filter.minimum_eval
-        && score < filter.maximum_eval
-        && record.board.occ().count_ones() >= filter.minimum_pieces
-        && record.ply.is_none_or(|ply| ply >= filter.minimum_ply && filter.maximum_ply.is_none_or(|max| ply <= max))
+    accepted_position(filter, record.board.score, record.board.occ().count_ones(), record.ply)
         && (!filter.exclude_check || record.in_check == Some(false))
         && (!filter.exclude_tactical || record.tactical == Some(false))
+}
+
+fn accepted_position(filter: &Filter, score: i16, pieces: u32, ply: Option<u16>) -> bool
+{
+    let score = u32::from(score.unsigned_abs());
+    score >= filter.minimum_eval
+        && score < filter.maximum_eval
+        && pieces >= filter.minimum_pieces
+        && ply.is_none_or(|ply| ply >= filter.minimum_ply && filter.maximum_ply.is_none_or(|max| ply <= max))
 }
 
 pub fn validate_source(source: &DataSource, filter: Option<&Filter>) -> Result<()>
@@ -134,23 +142,37 @@ pub fn validate(config: &DataConfig) -> Result<()>
     Ok(())
 }
 
-pub fn visit(
+pub fn visit(source: &DataSource, filter: Option<&Filter>, callback: impl FnMut(Record) -> Result<bool>) -> Result<()>
+{
+    visit_validated(source, true, filter, callback).map(|_| ())
+}
+
+fn visit_validated(
     source: &DataSource,
+    details: bool,
     filter: Option<&Filter>,
     mut callback: impl FnMut(Record) -> Result<bool>,
-) -> Result<()>
+) -> Result<(u64, u64)>
 {
     validate_source(source, filter)?;
+    
+    let mut positions = 0;
+    let mut skipped = 0;
 
     catch_unwind(AssertUnwindSafe(|| {
-        let mut skipped = 0;
-
-        visit_inner(source, true, &mut skipped, &mut |record| {
+        visit_inner(source, details, &mut skipped, &mut |record| {
             validate_board(&record.board)?;
-            if accepted(&record, filter) { callback(record) } else { Ok(false) }
+            if accepted(&record, filter) {
+                positions += 1;
+                callback(record)
+            } else {
+                Ok(false)
+            }
         })
     }))
-    .map_err(|_| anyhow!("Could not decode the dataset"))?
+    .map_err(|_| anyhow!("Could not decode the dataset"))??;
+
+    Ok((positions, skipped))
 }
 
 fn visit_inner(
@@ -370,22 +392,23 @@ pub fn sf_board(entry: &sfbinpack::TrainingDataEntry) -> Result<ChessBoard>
 
         bbs[index + 2] = bb;
     }
-    
+
     let black = entry.pos.side_to_move() == Color::Black;
     ensure!((-1..=1).contains(&entry.result), "Invalid result in the dataset");
-    
+
     let mut board =
         ChessBoard::from_raw(bbs, usize::from(black), 0, 0.5).map_err(|_| anyhow!("Invalid SF position"))?;
-    
+
     board.score = entry.score;
     board.result = (entry.result + 1) as u8;
-    
+
     Ok(board)
 }
 
 fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 {
-    use sfbinpack::chess::{piece::Piece, r#move::MoveType};
+    use sfbinpack::chess::{r#move::MoveType, piece::Piece};
+
     matches!(entry.mv.mtype(), MoveType::EnPassant | MoveType::Promotion)
         || (entry.mv.mtype() != MoveType::Castle && entry.pos.piece_at(entry.mv.to()) != Piece::none())
 }
@@ -393,19 +416,19 @@ fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 pub fn monty_fen(position: &Position, castling: &Castling) -> String
 {
     let basic = position.as_fen();
-    
+
     let mut fields = basic.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     let mut rights = String::new();
-    
+
     for (mask, side, flank) in [(4, 0, 1), (8, 0, 0), (1, 1, 1), (2, 1, 0)] {
         if position.rights() & mask != 0 {
             rights.push((if side == 0 { b'A' } else { b'a' } + castling.rook_file(side, flank) as u8) as char);
         }
     }
-    
+
     fields[2] = if rights.is_empty() { "-".to_string() } else { rights };
     fields[3] = if position.enp_sq() == 0 { "-".to_string() } else { square_name(position.enp_sq()) };
-    
+
     fields.join(" ")
 }
 
@@ -417,9 +440,9 @@ pub fn monty_uci(mov: bullet_lib::game::formats::montyformat::chess::Move, castl
     } else {
         mov.to() as u8
     };
-    
+
     let promotion = if mov.is_promo() { ["n", "b", "r", "q"][(mov.flag() & 3) as usize] } else { "" };
-    
+
     format!("{}{}{promotion}", square_name(mov.src() as u8), square_name(to))
 }
 
@@ -431,7 +454,7 @@ pub fn bullet_fen(board: &ChessBoard) -> String
     for (piece, square) in *board {
         squares[usize::from(square)] = "PNBRQKpnbrqk".as_bytes()[usize::from((piece & 7) + 6 * (piece >> 3))] as char
     }
-    
+
     let mut fen = String::new();
     for rank in (0..8).rev() {
         let mut empty = 0;
@@ -447,16 +470,16 @@ pub fn bullet_fen(board: &ChessBoard) -> String
                 fen.push(piece);
             }
         }
-        
+
         if empty > 0 {
             fen.push(char::from(b'0' + empty))
         }
-        
+
         if rank != 0 {
             fen.push('/')
         }
     }
-    
+
     fen.push_str(" w - - 0 1");
     fen
 }
@@ -484,10 +507,10 @@ impl DatasetReader
                 found = true;
                 Ok(true)
             })?;
-            
+
             ensure!(found, "No positions pass the filter");
         }
-        
+
         Ok(Self { config: config.clone(), seed, stop, error: Arc::default() })
     }
 
@@ -497,61 +520,51 @@ impl DatasetReader
     {
         let sources = &self.config.sources;
         let same_format = sources.iter().all(|source| source.format == sources[0].format);
-        
+
         let paths = sources.iter().map(|source| source.path.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
-        
+
         let filter = self.config.filter.clone();
-        
+
         let buffer = self.config.buffer_size_mb;
         let threads = self.config.loader_threads;
-        
+
         if same_format {
             match sources[0].format {
                 Format::Bullet if filter.is_none() => {
                     DirectSequentialDataLoader::new(&paths).read_chunks(skip, callback);
                     return;
                 },
-                
+
                 Format::Monty => {
                     MontyBinpackLoader::new_concat_multiple(&paths, buffer, threads, move |pos, mov, score, _| {
                         let Some(filter) = &filter else { return true };
                         let ply = pos.fullm().saturating_sub(1).saturating_mul(2) + pos.stm() as u16;
-                        let score = u32::from(score.unsigned_abs());
-                        score >= filter.minimum_eval
-                            && score < filter.maximum_eval
-                            && pos.occ().count_ones() >= filter.minimum_pieces
-                            && ply >= filter.minimum_ply
-                            && filter.maximum_ply.is_none_or(|max| ply <= max)
+                        accepted_position(filter, score, pos.occ().count_ones(), Some(ply))
                             && (!filter.exclude_check || !pos.in_check())
                             && (!filter.exclude_tactical || !(mov.is_capture() || mov.is_promo()))
                     })
                     .read_chunks(skip, callback);
                     return;
                 },
-                
+
                 Format::Sf => {
                     SfBinpackLoader::new_concat_multiple(&paths, buffer, threads, move |entry| {
                         if !valid_sf_score(entry.score) {
                             return false;
                         }
                         let Some(filter) = &filter else { return true };
-                        let score = u32::from(entry.score.unsigned_abs());
                         let pieces = (entry.pos.pieces_bb(Color::White).bits()
                             | entry.pos.pieces_bb(Color::Black).bits())
                         .count_ones();
-                        score >= filter.minimum_eval
-                            && score < filter.maximum_eval
-                            && pieces >= filter.minimum_pieces
-                            && entry.ply >= filter.minimum_ply
-                            && filter.maximum_ply.is_none_or(|max| entry.ply <= max)
+                        accepted_position(filter, entry.score, pieces, Some(entry.ply))
                             && (!filter.exclude_check || !entry.pos.is_checked(entry.pos.side_to_move()))
                             && (!filter.exclude_tactical || !sf_tactical(entry))
                     })
                     .read_chunks(skip, callback);
                     return;
                 },
-                
+
                 Format::Viri if filter.as_ref().is_none_or(|filter| filter.maximum_ply.is_none()) => {
                     use bullet_lib::game::formats::viriformat::dataformat::Filter as ViriFilter;
                     let mut upstream = ViriFilter::UNRESTRICTED;
@@ -584,54 +597,61 @@ impl DatasetReader
                     );
                     return;
                 },
-                
+
                 _ => {},
             }
         }
-        
-        let capacity = (buffer * 1024 * 1024 / size_of::<ChessBoard>()).max(1);
-        
+
+        self.read_fallback(skip, callback);
+    }
+
+    fn read_fallback(&self, skip: usize, mut callback: impl FnMut(&[ChessBoard]) -> bool)
+    {
+        let capacity = self.config.buffer_size_mb * 1024 * 1024 / size_of::<ChessBoard>();
+
         let mut values = Vec::with_capacity(capacity);
         let mut rng = StdRng::seed_from_u64(self.seed);
         let mut remaining = skip;
-        
+
         loop {
             let mut stopped = false;
-            for group in sources.chunks(threads.max(1)) {
+            for group in self.config.sources.chunks(self.config.loader_threads) {
                 let abort = AtomicBool::new(false);
                 let result = std::thread::scope(|scope| {
                     let receivers = group
                         .iter()
                         .map(|source| {
                             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                            
+
                             let abort = &abort;
                             let filter = self.config.filter.as_ref();
-                            
+
                             scope.spawn(move || {
                                 let mut batch = Vec::with_capacity(4096);
-                                let result = visit_boards(source, filter, |board| {
-                                    if source.format == Format::Sf && !valid_sf_score(board.score) {
-                                        return Ok(false);
-                                    }
-                                    
+                                let result = visit_validated(source, false, None, |record| {
                                     if abort.load(Ordering::Relaxed) {
                                         return Ok(true);
                                     }
-                                    
-                                    batch.push(board);
-                                    
+
+                                    if !accepted(&record, filter)
+                                        || (source.format == Format::Sf && !valid_sf_score(record.board.score))
+                                    {
+                                        return Ok(false);
+                                    }
+
+                                    batch.push(record.board);
+
                                     if batch.len() == 4096 {
                                         let ready = std::mem::replace(&mut batch, Vec::with_capacity(4096));
-                                        
+
                                         if sender.send(Ok(ready)).is_err() {
                                             return Ok(true);
                                         }
                                     }
-                                    
+
                                     Ok(false)
                                 });
-                                
+
                                 if let Err(error) = result {
                                     let _ = sender.send(Err(error));
                                 } else if !batch.is_empty() {
@@ -641,32 +661,33 @@ impl DatasetReader
                             receiver
                         })
                         .collect::<Vec<_>>();
-                    
+
                     let mut active = vec![true; receivers.len()];
                     while active.iter().any(|&active| active) {
                         for (index, receiver) in receivers.iter().enumerate() {
                             if !active[index] {
                                 continue;
                             }
-                            
+
                             let Ok(batch) = receiver.recv() else {
                                 active[index] = false;
                                 continue;
                             };
-                            
-                            for board in batch? {
+
+                            let batch = batch.inspect_err(|_| abort.store(true, Ordering::Relaxed))?;
+                            for board in batch {
                                 if remaining > 0 {
                                     remaining -= 1;
                                     continue;
                                 }
-                                
+
                                 values.push(board);
                                 if values.len() == capacity {
                                     values.shuffle(&mut rng);
-                                    
+
                                     stopped = callback(&values);
                                     values.clear();
-                                    
+
                                     if stopped {
                                         abort.store(true, Ordering::Relaxed);
                                         return Ok::<_, anyhow::Error>(());
@@ -675,22 +696,22 @@ impl DatasetReader
                             }
                         }
                     }
-                    
+
                     Ok(())
                 });
-                
+
                 if let Err(error) = result {
                     *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
                     return;
                 }
-                
+
                 if stopped {
                     return;
                 }
             }
             if !values.is_empty() {
                 values.shuffle(&mut rng);
-                
+
                 if callback(&values) {
                     return;
                 }
@@ -704,23 +725,27 @@ impl DataReader<ChessBoard> for DatasetReader
 {
     fn read_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, skip: usize, mut callback: F)
     {
-        let boundary = 6104 * self.config.batch_size;
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let boundary = BATCHES_PER_SUPERBATCH * self.config.batch_size;
         let mut emitted = 0usize;
         self.read(skip, |mut values| {
             while !values.is_empty() {
                 if emitted.is_multiple_of(boundary) && self.stop.load(Ordering::Relaxed) {
                     return true;
                 }
-                
+
                 let count = values.len().min(boundary - emitted % boundary);
                 if callback(&values[..count]) {
                     return true;
                 }
-                
+
                 emitted += count;
                 values = &values[count..];
             }
-            
+
             false
         });
     }
@@ -729,12 +754,12 @@ impl DataReader<ChessBoard> for DatasetReader
 pub fn parse_board(fen: &str) -> Result<Board>
 {
     bullet_lib::game::formats::viriformat::chess::CHESS960.store(true, Ordering::Relaxed);
-    
+
     let mut board = Board::new();
-    
+
     let mut fields = fen.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     ensure!(fields.len() == 6, "Invalid FEN in the dataset");
-    
+
     fields[2] = fields[2]
         .chars()
         .map(|right| match right {
@@ -749,9 +774,9 @@ pub fn parse_board(fen: &str) -> Result<Board>
         fields[2].chars().all(|right| right == '-' || ('A'..='H').contains(&right) || ('a'..='h').contains(&right)),
         "Invalid castling rights"
     );
-    
+
     board.set_from_fen(&fields.join(" "))?;
-    
+
     Ok(board)
 }
 
@@ -773,7 +798,7 @@ pub fn viri_fen(board: &Board) -> String
 pub fn viri_result(result: bullet_lib::game::formats::viriformat::dataformat::WDL) -> u8
 {
     use bullet_lib::game::formats::viriformat::dataformat::WDL;
-    
+
     match result {
         WDL::Win => 2,
         WDL::Draw => 1,
@@ -787,34 +812,10 @@ pub fn visit_boards(
     mut callback: impl FnMut(ChessBoard) -> Result<bool>,
 ) -> Result<()>
 {
-    validate_source(source, filter)?;
-    
-    let mut skipped = 0;
-    catch_unwind(AssertUnwindSafe(|| {
-        visit_inner(source, false, &mut skipped, &mut |record| {
-            validate_board(&record.board)?;
-            if accepted(&record, filter) { callback(record.board) } else { Ok(false) }
-        })
-    }))
-    .map_err(|_| anyhow!("Could not decode the dataset"))?
+    visit_validated(source, false, filter, |record| callback(record.board)).map(|_| ())
 }
 
-pub fn visit_counted(source: &DataSource, mut callback: impl FnMut(Record) -> Result<bool>) -> Result<(u64, u64)>
+pub fn visit_counted(source: &DataSource, callback: impl FnMut(Record) -> Result<bool>) -> Result<(u64, u64)>
 {
-    validate_source(source, None)?;
-    
-    let mut positions = 0;
-    let mut skipped = 0;
-    
-    catch_unwind(AssertUnwindSafe(|| {
-        visit_inner(source, true, &mut skipped, &mut |record| {
-            validate_board(&record.board)?;
-            
-            positions += 1;
-            callback(record)
-        })
-    }))
-    .map_err(|_| anyhow!("Could not decode the dataset"))??;
-    
-    Ok((positions, skipped))
+    visit_validated(source, true, None, callback)
 }
