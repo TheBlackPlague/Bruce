@@ -53,7 +53,7 @@ path = "data/monty_value_00_06.bin"
 [training.data.filter]
 minimum_ply = 14
 # maximum_ply = 90
-minimum_pieces = 0
+# minimum_pieces = 0
 # minimum_eval = 100
 maximum_eval = 8000
 exclude_tactical = true
