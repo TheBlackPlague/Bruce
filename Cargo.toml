@@ -19,6 +19,7 @@ bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7e
 bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
 bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6" }
 clap = { version = "4.5", features = ["derive"] }
+console = "0.16"
 crc32c = "0.6"
 ctrlc = "3.4"
 indicatif = "0.18"

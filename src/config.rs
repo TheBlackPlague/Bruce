@@ -347,7 +347,7 @@ impl Config
 
     pub fn checkpoint_value(&self) -> serde_json::Value
     {
-        serde_json::json!({
+        numerical_configuration(serde_json::json!({
             "name": self.name,
             "architecture": self.architecture,
             "seed": self.seed,
@@ -357,7 +357,7 @@ impl Config
             "optimizer": self.optimizer,
             "learning_rate": self.schedules["learning_rate"],
             "wdl": self.schedules["wdl"],
-        })
+        }))
     }
 
     pub fn validate(&self) -> Result<()>
@@ -420,6 +420,14 @@ impl Config
 
         Ok(())
     }
+}
+
+pub(crate) fn numerical_configuration(mut value: serde_json::Value) -> serde_json::Value
+{
+    if let Some(training) = value.get_mut("training").and_then(serde_json::Value::as_object_mut) {
+        training.remove("log_every");
+    }
+    value
 }
 
 impl DataConfig

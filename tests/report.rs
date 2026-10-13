@@ -98,27 +98,17 @@ fn tensorboard_rejects_unwritable_destination_and_invalid_name()
 #[test]
 fn unavailable_tensorboard_does_not_prevent_training_reporting()
 {
-    use bruce::{config::Config, report::Reporter};
-    use bullet_trainer::run::TrainingSteps;
+    use bruce::logging::Logger;
 
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("file");
 
     fs::write(&file, "occupied").unwrap();
 
-    let mut config = Config::from_toml(include_str!("../config/training.toml.default")).unwrap();
-    config.name = format!("report-test-{}", std::process::id());
-    config.tensorboard.enabled = true;
-    config.tensorboard.path = file;
-
-    let steps = TrainingSteps { batch_size: 16, batches_per_superbatch: 6104, start_superbatch: 3, end_superbatch: 4 };
-
-    let mut reporter = Reporter::new(&config, steps, true).unwrap();
-    reporter.message("Checkpoint saved");
-    reporter.finish().unwrap();
-
-    let log = std::path::Path::new("logs").join(format!("{}.log", config.name));
+    let log = root.path().join("fixture.log");
+    let logger = Logger::open(&log, Some((&file, "fixture"))).unwrap();
+    assert!(logger.take_diagnostics().iter().any(|message| message.contains("TensorBoard")));
+    logger.record("Checkpoint saved").unwrap();
+    logger.finish().unwrap();
     assert!(fs::read_to_string(&log).unwrap().contains("Checkpoint saved"));
-
-    fs::remove_file(log).unwrap();
 }

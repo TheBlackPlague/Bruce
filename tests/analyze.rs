@@ -22,11 +22,13 @@ fn finite_analysis_normalizes_black_scores_and_respects_position_limit()
 {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("positions.txt");
+
     std::fs::write(
         &path,
         format!("{POSITION} w - - 0 1 ; -100 ; 0\n{POSITION} b - - 0 1 ; -300 ; 0\n{POSITION} w - - 0 1 ; 100 ; 1\n"),
     )
     .unwrap();
+
     let mut options = options(path);
     let report = analyze::run(&options).unwrap();
 
@@ -57,4 +59,41 @@ fn empty_and_truncated_inputs_fail_without_a_partial_report()
     std::fs::write(&path, format!("{POSITION} w - - 0 1 ; 0 ; 0.5\nbroken")).unwrap();
 
     assert!(analyze::run(&options).is_err());
+}
+
+#[test]
+fn cancellation_is_distinct_from_an_analysis_error()
+{
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use bruce::cli::{Cancelled, OutputOptions, Reporter};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("positions.txt");
+    std::fs::write(&path, format!("{POSITION} w - - 0 1;0;0.5\n")).unwrap();
+    let reporter = Reporter::new(OutputOptions::default());
+    let result = analyze::run_reported(&options(path), &reporter, Arc::new(AtomicBool::new(true)));
+
+    assert!(result.err().unwrap().is::<Cancelled>());
+}
+
+#[test]
+fn reporting_preserves_counts_when_a_limit_exceeds_the_dataset()
+{
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use bruce::cli::{OutputOptions, Reporter};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("positions.txt");
+    std::fs::write(&path, format!("{POSITION} w - - 0 1;-100;0\n{POSITION} w - - 0 1;100;1\n")).unwrap();
+    let mut options = options(path);
+    options.limit = Some(10_000);
+    let reporter = Reporter::new(OutputOptions::default());
+    let report = analyze::run_reported(&options, &reporter, Arc::new(AtomicBool::new(false))).unwrap();
+
+    assert_eq!(report.positions, 2);
+    assert!(!report.limit_reached);
+    assert_eq!(report.scores.mean_cp, 0.0);
+    assert_eq!((report.results.losses, report.results.wins), (1, 1));
 }

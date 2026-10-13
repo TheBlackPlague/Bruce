@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
@@ -144,23 +144,24 @@ pub fn validate(config: &DataConfig) -> Result<()>
 
 pub fn visit(source: &DataSource, filter: Option<&Filter>, callback: impl FnMut(Record) -> Result<bool>) -> Result<()>
 {
-    visit_validated(source, true, filter, callback).map(|_| ())
+    visit_validated(source, true, filter, None, callback).map(|_| ())
 }
 
 fn visit_validated(
     source: &DataSource,
     details: bool,
     filter: Option<&Filter>,
+    stop: Option<&AtomicBool>,
     mut callback: impl FnMut(Record) -> Result<bool>,
 ) -> Result<(u64, u64)>
 {
     validate_source(source, filter)?;
-    
+
     let mut positions = 0;
     let mut skipped = 0;
 
     catch_unwind(AssertUnwindSafe(|| {
-        visit_inner(source, details, &mut skipped, &mut |record| {
+        visit_inner(source, details, stop, &mut skipped, &mut |record| {
             validate_board(&record.board)?;
             if accepted(&record, filter) {
                 positions += 1;
@@ -178,6 +179,7 @@ fn visit_validated(
 fn visit_inner(
     source: &DataSource,
     details: bool,
+    stop: Option<&AtomicBool>,
     skipped: &mut u64,
     callback: &mut impl FnMut(Record) -> Result<bool>,
 ) -> Result<()>
@@ -192,13 +194,15 @@ fn visit_inner(
 
             DirectSequentialDataLoader::new(&[&path]).read_chunks(0, |boards: &[ChessBoard]| {
                 for &board in boards {
-                    status = callback(Record {
-                        board,
-                        fen: None,
-                        next_move: None,
-                        ply: None,
-                        in_check: None,
-                        tactical: None,
+                    status = check_cancelled(stop).and_then(|()| {
+                        callback(Record {
+                            board,
+                            fen: None,
+                            next_move: None,
+                            ply: None,
+                            in_check: None,
+                            tactical: None,
+                        })
                     });
 
                     seen += 1;
@@ -217,6 +221,7 @@ fn visit_inner(
         Format::Text => {
             let separator = source.separator.as_deref().context("Text data needs a separator")?;
             for line in BufReader::new(File::open(&source.path)?).lines() {
+                check_cancelled(stop)?;
                 let line = line?;
                 if line.trim().is_empty() {
                     continue;
@@ -258,11 +263,15 @@ fn visit_inner(
         Format::Monty => {
             let mut reader = BufReader::new(File::open(&source.path)?);
             while !reader.fill_buf()?.is_empty() {
+                check_cancelled(stop)?;
+
                 let game = MontyValueFormat::deserialise_from(&mut reader, Vec::new())
                     .context("Could not read a Monty game")?;
                 let mut position = game.startpos;
 
                 for entry in game.moves {
+                    check_cancelled(stop)?;
+
                     let board = ChessBoard::from_raw(position.bbs(), position.stm(), entry.score, game.result)
                         .map_err(|_| anyhow!("Invalid Monty position"))?;
 
@@ -287,11 +296,15 @@ fn visit_inner(
             let mut reader = BufReader::new(File::open(&source.path)?);
 
             while !reader.fill_buf()?.is_empty() {
+                check_cancelled(stop)?;
+
                 let game = Game::deserialise_from(&mut reader, Vec::new()).context("Could not read a Viri game")?;
                 let result = viri_result(game.outcome());
                 let mut position = game.initial_position();
 
                 for (mov, score) in game.moves {
+                    check_cancelled(stop)?;
+
                     let score = score.get();
                     let record = Record {
                         board: position.to_bulletformat(result, score)?,
@@ -313,8 +326,12 @@ fn visit_inner(
             let mut bytes = Vec::new();
 
             while sfbinpack::read_chunk_into(&mut reader, &mut bytes)? {
+                check_cancelled(stop)?;
+
                 let mut chunk = sfbinpack::ChunkReader::default();
                 while chunk.has_next(&bytes) {
+                    check_cancelled(stop)?;
+
                     let entry = chunk.next(&bytes);
                     if entry.score == 32002 {
                         *skipped += 1;
@@ -407,7 +424,7 @@ pub fn sf_board(entry: &sfbinpack::TrainingDataEntry) -> Result<ChessBoard>
 
 fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 {
-    use sfbinpack::chess::{r#move::MoveType, piece::Piece};
+    use sfbinpack::chess::{piece::Piece, r#move::MoveType};
 
     matches!(entry.mv.mtype(), MoveType::EnPassant | MoveType::Promotion)
         || (entry.mv.mtype() != MoveType::Castle && entry.pos.piece_at(entry.mv.to()) != Piece::none())
@@ -500,7 +517,7 @@ impl DatasetReader
         config.validate()?;
         for source in &config.sources {
             let mut found = false;
-            visit_boards(source, config.filter.as_ref(), |board| {
+            visit_boards_stoppable(source, config.filter.as_ref(), &stop, |board| {
                 if source.format == Format::Sf && !valid_sf_score(board.score) {
                     return Ok(false);
                 }
@@ -532,7 +549,9 @@ impl DatasetReader
         if same_format {
             match sources[0].format {
                 Format::Bullet if filter.is_none() => {
-                    DirectSequentialDataLoader::new(&paths).read_chunks(skip, callback);
+                    if let Err(error) = read_bullet(&paths, skip, callback) {
+                        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{error:#}"));
+                    }
                     return;
                 },
 
@@ -628,7 +647,7 @@ impl DatasetReader
 
                             scope.spawn(move || {
                                 let mut batch = Vec::with_capacity(4096);
-                                let result = visit_validated(source, false, None, |record| {
+                                let result = visit_validated(source, false, None, None, |record| {
                                     if abort.load(Ordering::Relaxed) {
                                         return Ok(true);
                                     }
@@ -701,7 +720,7 @@ impl DatasetReader
                 });
 
                 if let Err(error) = result {
-                    *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                    *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{error:#}"));
                     return;
                 }
 
@@ -812,10 +831,151 @@ pub fn visit_boards(
     mut callback: impl FnMut(ChessBoard) -> Result<bool>,
 ) -> Result<()>
 {
-    visit_validated(source, false, filter, |record| callback(record.board)).map(|_| ())
+    visit_validated(source, false, filter, None, |record| callback(record.board)).map(|_| ())
 }
 
 pub fn visit_counted(source: &DataSource, callback: impl FnMut(Record) -> Result<bool>) -> Result<(u64, u64)>
 {
-    visit_validated(source, true, None, callback)
+    visit_validated(source, true, None, None, callback)
+}
+
+pub fn visit_boards_stoppable(
+    source: &DataSource,
+    filter: Option<&Filter>,
+    stop: &AtomicBool,
+    mut callback: impl FnMut(ChessBoard) -> Result<bool>,
+) -> Result<()>
+{
+    visit_validated(source, false, filter, Some(stop), |record| callback(record.board)).map(|_| ())
+}
+
+pub fn visit_counted_stoppable(
+    source: &DataSource,
+    stop: &AtomicBool,
+    callback: impl FnMut(Record) -> Result<bool>,
+) -> Result<(u64, u64)>
+{
+    visit_validated(source, true, None, Some(stop), callback)
+}
+
+fn check_cancelled(stop: Option<&AtomicBool>) -> Result<()>
+{
+    if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+        return Err(crate::cli::Cancelled.into());
+    }
+    Ok(())
+}
+
+fn read_bullet(paths: &[&str], skip: usize, mut callback: impl FnMut(&[ChessBoard]) -> bool) -> Result<()>
+{
+    let sizes = paths
+        .iter()
+        .map(|path| Ok(std::fs::metadata(path)?.len() as usize / size_of::<ChessBoard>()))
+        .collect::<Result<Vec<_>>>()?;
+    let positions: usize = sizes.iter().sum();
+    ensure!(positions > 0, "The dataset is empty");
+    let mut offset = skip % positions;
+    let mut first = 0;
+    while offset >= sizes[first] {
+        offset -= sizes[first];
+        first += 1;
+    }
+    let mut rotated = paths.to_vec();
+    rotated.rotate_left(first);
+    if offset > 0 {
+        if read_bullet_tail(rotated[0], offset, &mut callback)? {
+            return Ok(());
+        }
+        rotated.rotate_left(1);
+    }
+    DirectSequentialDataLoader::new(&rotated).read_chunks(0, callback);
+    Ok(())
+}
+
+fn read_bullet_tail(path: &str, offset: usize, callback: &mut impl FnMut(&[ChessBoard]) -> bool) -> Result<bool>
+{
+    let mut file = File::open(path).context("Could not open the resumed dataset")?;
+    file.seek(SeekFrom::Start((offset as u64) * size_of::<ChessBoard>() as u64))?;
+    let capacity = (128 * 1024 * 1024) / size_of::<ChessBoard>();
+    let mut boards = vec![ChessBoard::default(); capacity];
+
+    loop {
+        // SAFETY: pinned bullet format ChessBoard is repr(C), exactly 32 bytes, with integer fields and no padding;
+        // every byte pattern is valid
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(boards.as_mut_ptr().cast::<u8>(), boards.len() * size_of::<ChessBoard>())
+        };
+
+        let count = file.read(bytes).context("Could not read the resumed dataset")?;
+
+        if count == 0 {
+            return Ok(false);
+        }
+
+        ensure!(count.is_multiple_of(size_of::<ChessBoard>()), "The resumed dataset is truncated");
+        if callback(&boards[..count / size_of::<ChessBoard>()]) {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests
+{
+    use bullet_lib::game::formats::bulletformat::BulletFormat;
+
+    use super::*;
+
+    #[test]
+    fn silent_resume_adapter_preserves_pinned_loader_sequence_across_files_and_epochs()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let files = [root.path().join("a.bullet"), root.path().join("b.bullet")];
+
+        for (index, path) in files.iter().enumerate() {
+            let mut file = std::io::BufWriter::new(File::create(path).unwrap());
+
+            for score in (index * 3)..(index * 3 + 3) {
+                let mut board = parse_board("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap().to_bulletformat(1, 0).unwrap();
+                board.score = score as i16;
+
+                ChessBoard::write_to_bin(&mut file, &[board]).unwrap();
+            }
+        }
+
+        let names = files.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>();
+        for skip in [0, 1, 3, 4, 6, 13] {
+            let mut expected = Vec::new();
+
+            DirectSequentialDataLoader::new(&names).read_chunks(skip, |boards: &[ChessBoard]| {
+                expected.extend(boards.iter().map(|b| b.score).take(16 - expected.len()));
+                expected.len() == 16
+            });
+
+            let mut actual = Vec::new();
+            read_bullet(&names, skip, |boards| {
+                actual.extend(boards.iter().map(|b| b.score).take(16 - actual.len()));
+                actual.len() == 16
+            })
+            .unwrap();
+
+            assert_eq!(actual, expected, "skip {skip}");
+        }
+    }
+
+    #[test]
+    fn cancellation_is_checked_before_filtering()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("positions.txt");
+        std::fs::write(&path, "4k3/8/8/8/8/8/8/4K3 w - - 0 1;0;0.5\n").unwrap();
+
+        let source = DataSource { path, format: Format::Text, separator: Some(";".into()) };
+        let filter = Filter { minimum_eval: 100, ..Default::default() };
+
+        let error =
+            visit_boards_stoppable(&source, Some(&filter), &AtomicBool::new(true), |_| panic!("filtered callback"))
+                .unwrap_err();
+        assert!(error.is::<crate::cli::Cancelled>());
+    }
 }

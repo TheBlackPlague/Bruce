@@ -16,7 +16,11 @@ use bullet_trainer::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{BULLET_REVISION, architecture::Architecture, config::Config};
+use crate::{
+    BULLET_REVISION,
+    architecture::Architecture,
+    config::{Config, numerical_configuration},
+};
 
 const STATE_FILES: [&str; 3] = ["weights.bin", "momentum.bin", "velocity.bin"];
 
@@ -98,7 +102,10 @@ impl Checkpoints
     {
         let manifest = Manifest::read(path, self.architecture)?;
 
-        ensure!(manifest.configuration == self.configuration, "Configuration differs from the checkpoint");
+        ensure!(
+            numerical_configuration(manifest.configuration.clone()) == self.configuration,
+            "Configuration differs from the checkpoint; restore the original numerical training settings"
+        );
         ensure!(manifest.datasets == self.datasets, "Datasets differ from the checkpoint");
         ensure!(manifest.completed_superbatch > 0, "Checkpoint has no completed training");
         ensure!(manifest.completed_superbatch < self.final_superbatch, "Training is already complete");
@@ -128,7 +135,6 @@ impl Checkpoints
         ensure!(superbatch > 0 && superbatch <= self.final_superbatch, "Invalid checkpoint step");
         fs::create_dir_all(&self.directory).context("Cannot create checkpoint directory")?;
 
-        // The reservation prevents checkpoint from being overwritten
         let reservation = self.directory.join(format!(".{}-{superbatch}.lock", self.name));
         fs::create_dir(&reservation).context("Checkpoint is already being saved")?;
         let _reservation = Reservation(reservation);

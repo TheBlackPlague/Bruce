@@ -31,7 +31,7 @@ from a previously saved checkpoint.
 The recommended build environment is:
 
 * 👽 Git >= 2.30
-* 🦀 Rust >= 1.88
+* 🦀 Rust == 1.99
 * 🟢 NVIDIA CUDA Toolkit
 
 Clone and build Bruce with:
@@ -76,7 +76,7 @@ Bruce training is controlled through a TOML configuration file. Before beginning
 can be checked with:
 
 ```bash
-./target/release/bruce check --config config/training.toml
+./target/release/bruce train --check --config config/training.toml
 ```
 
 Training can then be started with:

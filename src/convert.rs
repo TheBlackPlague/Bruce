@@ -1,8 +1,11 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::PathBuf,
-    sync::atomic::Ordering,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -16,9 +19,9 @@ use bullet_lib::game::formats::{
         self, TrainingDataEntry,
         chess::{
             coords::Square,
-            r#move::{Move as SfMove, MoveType},
             piece::Piece,
             piecetype::PieceType,
+            r#move::{Move as SfMove, MoveType},
         },
     },
     viriformat::{
@@ -26,13 +29,14 @@ use bullet_lib::game::formats::{
             CHESS960,
             board::{Board, DrawType, GameOutcome, WinType, movegen::MoveList},
             chessmove::Move,
-        },
+        }, 
         dataformat::Game,
     },
 };
 use clap::Args;
 
 use crate::{
+    cli::{self, Progress, Reporter},
     config::DataSource,
     data::{self, Format, Record},
 };
@@ -77,12 +81,60 @@ impl std::fmt::Display for Summary
 
 pub fn run(options: &Options, plain: bool) -> Result<Summary>
 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(options, plain)))
-        .map_err(|_| anyhow!("Could not convert the dataset"))?
+    let reporter = Reporter::new(cli::OutputOptions {
+        display: if plain { cli::DisplayMode::Plain } else { cli::DisplayMode::Auto },
+        ..Default::default()
+    });
+
+    reporter.start("Convert", &options.input.to_string_lossy());
+    reporter.context("Output", options.output.to_string_lossy());
+
+    let result = run_reported(options, &reporter, Arc::new(AtomicBool::new(false)));
+    if let Err(error) = &result {
+        reporter.error(
+            "Dataset conversion failed",
+            "Check the input format and destination permissions",
+            &format!("{error:#}"),
+        );
+    }
+
+    let outcome = if result.is_ok() { cli::Outcome::Success } else { cli::Outcome::Failed };
+    let finished = reporter.finish(outcome);
+    let summary = result?;
+
+    finished?;
+
+    Ok(summary)
 }
 
-fn run_inner(options: &Options, plain: bool) -> Result<Summary>
+pub fn run_reported(options: &Options, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Summary>
 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_inner(options, reporter, &stop))).map_err(|panic| {
+        let detail = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("Unknown panic while decoding or encoding the dataset");
+
+        anyhow!("{detail}").context("Could not convert the dataset")
+    })?
+}
+
+fn check_cancelled(stop: &AtomicBool) -> Result<()>
+{
+    if stop.load(Ordering::Relaxed) {
+        return Err(cli::Cancelled.into());
+    }
+
+    Ok(())
+}
+
+fn run_inner(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Result<Summary>
+{
+    reporter.phase("Preparing conversion");
+
+    check_cancelled(stop)?;
+
     let threads = options.threads.unwrap_or(1);
 
     ensure!((1..=256).contains(&threads), "Threads must be between 1 and 256");
@@ -95,6 +147,7 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
 
     let source = DataSource { format: options.from, path: options.input.clone(), separator: options.separator.clone() };
     data::validate_source(&source, None)?;
+    check_cancelled(stop)?;
 
     let parent = options
         .output
@@ -105,30 +158,63 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
 
     let mut summary =
         Summary { positions: 0, skipped: 0, input_bytes: std::fs::metadata(&options.input)?.len(), output_bytes: 0 };
-    let progress = if plain || std::env::var_os("CI").is_some() || std::env::var("TERM").as_deref() == Ok("dumb") {
-        indicatif::ProgressBar::hidden()
-    } else {
-        indicatif::ProgressBar::new_spinner()
-    };
-
-    progress.set_message("Converting dataset");
-    progress.enable_steady_tick(std::time::Duration::from_millis(200));
 
     if options.from == options.to {
-        let (positions, skipped) = data::visit_counted(&source, |_| Ok(false))?;
+        reporter.phase("Checking positions before copying");
+
+        let mut validated: u64 = 0;
+        let (positions, skipped) = data::visit_counted_stoppable(&source, stop, |_| {
+            check_cancelled(stop)?;
+            validated += 1;
+            if validated.is_multiple_of(8192) {
+                reporter.progress(Progress::Work { completed: validated, total: None, unit: "positions checked" });
+            }
+            Ok(false)
+        })?;
+
         summary.positions = positions + skipped;
-        std::io::copy(&mut File::open(&options.input)?, temporary.as_file_mut())?;
+        reporter.progress(Progress::Work { completed: summary.positions, total: None, unit: "positions checked" });
+
+        check_cancelled(stop)?;
+        reporter.phase("Copying validated dataset");
+
+        let mut reader = File::open(&options.input)?;
+        let mut buffer = [0; 64 * 1024];
+        let mut copied = 0;
+
+        loop {
+            check_cancelled(stop)?;
+
+            let length = reader.read(&mut buffer)?;
+            if length == 0 {
+                break;
+            }
+
+            temporary.as_file_mut().write_all(&buffer[..length])?;
+            copied += length as u64;
+
+            reporter.progress(Progress::Work {
+                completed: copied,
+                total: Some(summary.input_bytes),
+                unit: "bytes copied",
+            });
+        }
     } else {
+        reporter.phase("Converting positions");
+
         CHESS960.store(true, Ordering::Relaxed);
+
         let mut writer = BufWriter::new(temporary.as_file_mut());
+
         if matches!(options.from, Format::Bullet | Format::Text)
             && matches!(options.to, Format::Monty | Format::Viri | Format::Sf)
         {
-            eprintln!("Positions without moves use a legal placeholder move; original games cannot be recovered");
+            reporter
+                .warning("Positions without moves use a legal placeholder move; original games cannot be recovered");
         }
 
         if options.from == Format::Bullet && options.to != Format::Bullet {
-            eprintln!("Bullet data has no original side, castling rights or move counters");
+            reporter.warning("Bullet data has no original side, castling rights or move counters");
         }
 
         if options.from == Format::Monty && options.to == Format::Viri {
@@ -136,7 +222,8 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
                 options,
                 &mut writer,
                 threads,
-                &progress,
+                reporter,
+                stop,
                 |reader| {
                     let game = MontyValueFormat::deserialise_from(reader, Vec::new())?;
                     let positions = game.moves.len();
@@ -149,10 +236,12 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
                 options,
                 &mut writer,
                 threads,
-                &progress,
+                reporter,
+                stop,
                 |reader| {
                     let game = Game::deserialise_from(reader, Vec::new())?;
                     let positions = game.moves.len();
+
                     Ok((game, positions))
                 },
                 encode_viri_games,
@@ -160,7 +249,8 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
         } else {
             let mut records = Vec::with_capacity(8192);
 
-            let (_, skipped) = data::visit_counted(&source, |record| {
+            let (_, skipped) = data::visit_counted_stoppable(&source, stop, |record| {
+                check_cancelled(stop)?;
                 if options.from == Format::Sf
                     && options.to == Format::Viri
                     && i16::try_from(record.white_score()).is_err()
@@ -170,32 +260,56 @@ fn run_inner(options: &Options, plain: bool) -> Result<Summary>
                 }
 
                 records.push(record);
-                summary.positions += 1;
                 if records.len() == 8192 {
                     write_parallel(&records, threads, |chunk| encode(chunk, options), &mut writer)?;
-
+                    summary.positions += records.len() as u64;
                     records.clear();
-                    progress.set_message(format!("{} positions", summary.positions));
+
+                    reporter.progress(Progress::Work {
+                        completed: summary.positions,
+                        total: None,
+                        unit: "positions converted",
+                    });
                 }
 
                 Ok(false)
             })?;
 
             summary.skipped += skipped;
-            ensure!(summary.positions > 0, "No positions could be converted");
+
+            check_cancelled(stop)?;
 
             write_parallel(&records, threads, |chunk| encode(chunk, options), &mut writer)?;
+            summary.positions += records.len() as u64;
+
+            ensure!(summary.positions > 0, "No positions could be converted");
         }
 
-        writer.flush()?;
+        reporter.progress(Progress::Work { completed: summary.positions, total: None, unit: "positions converted" });
+        check_cancelled(stop)?;
+
+        reporter.phase("Flushing converted dataset");
+        writer.flush().context("Could not flush the converted dataset")?;
     }
 
-    temporary.as_file().sync_all()?;
+    check_cancelled(stop)?;
+    reporter.phase("Saving converted dataset");
+    temporary.as_file().sync_all().context("Could not sync the converted dataset")?;
 
     summary.output_bytes = temporary.as_file().metadata()?.len();
-    temporary.persist_noclobber(&options.output).map_err(|error| anyhow!(error.error))?;
+    check_cancelled(stop)?;
 
-    progress.finish_and_clear();
+    temporary
+        .persist_noclobber(&options.output)
+        .map_err(|error| anyhow!(error.error))
+        .context("Could not publish the converted dataset; check the destination permissions and free space")?;
+
+    if summary.skipped > 0 {
+        reporter.warning(&format!(
+            "Skipped {} positions with scores that cannot be represented in the output",
+            summary.skipped
+        ));
+    }
 
     Ok(summary)
 }
@@ -223,6 +337,7 @@ fn write_parallel<T: Sync>(
         for handle in handles {
             writer.write_all(&handle.join().map_err(|_| anyhow!("Could not encode the dataset"))??)?
         }
+
         Ok(())
     })
 }
@@ -423,7 +538,8 @@ fn convert_games<T: Sync>(
     options: &Options,
     writer: &mut impl Write,
     threads: usize,
-    progress: &indicatif::ProgressBar,
+    reporter: &Reporter,
+    stop: &AtomicBool,
     decode: impl Fn(&mut BufReader<File>) -> Result<(T, usize)>,
     encode: impl Fn(&[T]) -> Result<Vec<u8>> + Sync,
 ) -> Result<u64>
@@ -433,6 +549,7 @@ fn convert_games<T: Sync>(
 
     let mut count = 0;
     while !reader.fill_buf()?.is_empty() {
+        check_cancelled(stop)?;
         let (game, positions) = decode(&mut reader)?;
         count += positions as u64;
         games.push(game);
@@ -440,11 +557,14 @@ fn convert_games<T: Sync>(
         if games.len() == threads * 64 {
             write_parallel(&games, threads, &encode, writer)?;
             games.clear();
-            progress.set_message(format!("{count} positions"));
+            reporter.progress(Progress::Work { completed: count, total: None, unit: "positions converted" });
         }
     }
 
+    check_cancelled(stop)?;
     write_parallel(&games, threads, &encode, writer)?;
+
+    reporter.progress(Progress::Work { completed: count, total: None, unit: "positions converted" });
     ensure!(count > 0, "No positions could be converted");
 
     Ok(count)

@@ -1,9 +1,11 @@
 pub mod analyze;
 pub mod architecture;
 pub mod checkpoint;
+pub mod cli;
 pub mod config;
 pub mod convert;
 pub mod data;
+pub mod logging;
 pub mod report;
 pub mod schedule;
 pub mod train;

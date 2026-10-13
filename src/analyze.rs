@@ -1,9 +1,11 @@
 use std::{
     collections::BTreeMap,
-    fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, ensure};
@@ -23,6 +25,7 @@ use serde::Serialize;
 use crate::{
     architecture::{Architecture, SCALE},
     checkpoint,
+    cli::{self, Progress, Reporter},
     config::DataSource,
     data,
 };
@@ -119,12 +122,39 @@ pub struct Calibration
 
 pub fn run(options: &Options) -> Result<Report>
 {
+    let reporter = Reporter::new(cli::OutputOptions::default());
+    reporter.start("Analyze", &options.source.path.to_string_lossy());
+
+    let result = run_reported(options, &reporter, Arc::new(AtomicBool::new(false)));
+    if let Err(error) = &result {
+        reporter.error(
+            "Dataset analysis failed",
+            "Check the input format and checkpoint settings",
+            &format!("{error:#}"),
+        );
+    }
+
+    let outcome = if result.is_ok() { cli::Outcome::Success } else { cli::Outcome::Failed };
+    let finished = reporter.finish(outcome);
+    let report = result?;
+    finished?;
+
+    Ok(report)
+}
+
+pub fn run_reported(options: &Options, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Report>
+{
+    reporter.phase("Preparing analysis");
+    check_cancelled(&stop)?;
+
     ensure!(options.limit != Some(0), "Position limit must be positive");
     ensure!(options.gpu >= 0, "GPU index must not be negative");
     ensure!(
         options.network.is_some() == options.architecture.is_some(),
         "Network analysis needs both a checkpoint and an architecture"
     );
+
+    data::validate_source(&options.source, None)?;
 
     let mut report = Accumulator::new(options.architecture);
     let mut evaluator = match (&options.network, options.architecture) {
@@ -134,17 +164,28 @@ pub fn run(options: &Options) -> Result<Report>
                 "Network analysis needs a GPU build"
             );
 
+            reporter.phase("Loading checkpoint for analysis");
             let weights = checkpoint::load_weights(path, architecture)?;
-            let device =
-                Device::<ExecutionContext>::new(options.gpu).map_err(|_| anyhow::anyhow!("Cannot open GPU"))?;
+            check_cancelled(&stop)?;
+            reporter.phase("Preparing network inference");
+            let device = Device::<ExecutionContext>::new(options.gpu)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("Cannot open GPU")?;
 
             Some(Evaluator::new(architecture, &weights, device)?)
         },
         _ => None,
     };
 
+    check_cancelled(&stop)?;
+    reporter.phase(if evaluator.is_some() {
+        "Analyzing positions and network predictions"
+    } else {
+        "Analyzing positions"
+    });
     let mut batch = Vec::with_capacity(BATCH_SIZE);
-    data::visit_boards(&options.source, None, |board| {
+    data::visit_boards_stoppable(&options.source, None, &stop, |board| {
+        check_cancelled(&stop)?;
         report.observe(board);
 
         if evaluator.is_some() {
@@ -154,14 +195,29 @@ pub fn run(options: &Options) -> Result<Report>
         if batch.len() == BATCH_SIZE {
             evaluate_batch(evaluator.as_mut(), &mut batch, &mut report)?;
         }
+        if report.count.is_multiple_of(BATCH_SIZE as u64) {
+            reporter.progress(Progress::Work { completed: report.count, total: None, unit: "positions analyzed" });
+        }
 
         Ok(options.limit.is_some_and(|limit| report.count == limit))
     })?;
 
+    check_cancelled(&stop)?;
     evaluate_batch(evaluator.as_mut(), &mut batch, &mut report)?;
+    reporter.progress(Progress::Work { completed: report.count, total: None, unit: "positions analyzed" });
 
     ensure!(report.count > 0, "Dataset contains no positions");
+    check_cancelled(&stop)?;
+    reporter.phase("Finalizing analysis");
     Ok(report.finish(options.limit))
+}
+
+fn check_cancelled(stop: &AtomicBool) -> Result<()>
+{
+    if stop.load(Ordering::Relaxed) {
+        return Err(cli::Cancelled.into());
+    }
+    Ok(())
 }
 
 fn evaluate_batch<G: Gpu>(
@@ -210,13 +266,25 @@ impl Report
 
     pub fn write(&self, path: &Path) -> Result<()>
     {
-        let file = File::options().write(true).create_new(true).open(path).context("Cannot create analysis report")?;
-        let mut writer = BufWriter::new(file);
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
 
-        serde_json::to_writer_pretty(&mut writer, self).context("Cannot write analysis report")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent).context("Cannot create analysis report")?;
+        {
+            let mut writer = BufWriter::new(temporary.as_file_mut());
 
-        writer.write_all(b"\n")?;
-        writer.flush().context("Cannot finish analysis report")
+            serde_json::to_writer_pretty(&mut writer, self).context("Cannot write analysis report")?;
+
+            writer.write_all(b"\n")?;
+            writer.flush().context("Cannot finish analysis report")?;
+        }
+
+        temporary.as_file().sync_all().context("Cannot sync analysis report")?;
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| anyhow::anyhow!(error.error))
+            .context("Cannot publish analysis report; choose an unused path in a writable directory")?;
+
+        Ok(())
     }
 }
 
@@ -419,9 +487,15 @@ impl<G: Gpu> Evaluator<G>
     {
         let definition: ModelDefinition = architecture.definition();
 
-        let forward = definition.lower_forward(BATCH_SIZE).map_err(|_| anyhow::anyhow!("Cannot prepare network"))?;
+        let forward = definition
+            .lower_forward(BATCH_SIZE)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot prepare network")?;
 
-        let device_weights = weights.to_device(&device).map_err(|_| anyhow::anyhow!("Cannot load network onto GPU"))?;
+        let device_weights = weights
+            .to_device(&device)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot load network onto GPU")?;
 
         let mut buffers = BTreeMap::new();
         for (id, (name, _)) in definition.ir().weights() {
@@ -433,18 +507,25 @@ impl<G: Gpu> Evaluator<G>
         let (output_node, _) =
             definition.outputs().iter().find(|(_, name)| name == "output").context("Network has no output")?;
         let output_id = forward.map()[output_node];
-        let output_type =
-            forward.ir().get_node(output_id).map_err(|_| anyhow::anyhow!("Cannot prepare network output"))?.ty();
+        let output_type = forward
+            .ir()
+            .get_node(output_id)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot prepare network output")?
+            .ty();
         let output = Buffer::zeroed(&device, output_type.dtype(), output_type.size().get())
-            .map_err(|_| anyhow::anyhow!("Cannot allocate network output"))?;
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot allocate network output")?;
 
         buffers.insert(output_id, output.clone());
 
-        let stream = device.new_stream().map_err(|_| anyhow::anyhow!("Cannot open GPU stream"))?;
+        let stream =
+            device.new_stream().map_err(|error| anyhow::anyhow!("{error:?}")).context("Cannot open GPU stream")?;
 
         let mut function = Function::new(device.clone(), forward.ir().clone())
-            .map_err(|_| anyhow::anyhow!("Cannot prepare network inference"))?;
-        function.prealloc().map_err(|_| anyhow::anyhow!("Cannot allocate network buffers"))?;
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot prepare network inference")?;
+        function.prealloc().map_err(|error| anyhow::anyhow!("{error:?}")).context("Cannot allocate network buffers")?;
 
         let pool = HostPool::new(device.clone());
 
@@ -466,11 +547,14 @@ impl<G: Gpu> Evaluator<G>
         let prepared = self
             .mapper
             .map(&self.pool, batch, Default::default(), 1)
-            .map_err(|_| anyhow::anyhow!("Cannot prepare network inputs"))?;
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot prepare network inputs")?;
 
         if self.input_buffers.is_empty() {
-            self.input_buffers =
-                prepared.to_device(&self.device).map_err(|_| anyhow::anyhow!("Cannot transfer network inputs"))?;
+            self.input_buffers = prepared
+                .to_device(&self.device)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("Cannot transfer network inputs")?;
 
             for (name, buffer) in &self.input_buffers {
                 self.buffers.insert(self.inputs[name], buffer.clone());
@@ -478,18 +562,27 @@ impl<G: Gpu> Evaluator<G>
         } else {
             let transfers = prepared
                 .copy_to_device_async(&self.stream, &self.input_buffers)
-                .map_err(|_| anyhow::anyhow!("Cannot transfer network inputs"))?;
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .context("Cannot transfer network inputs")?;
 
             for transfer in transfers {
-                transfer.value().map_err(|_| anyhow::anyhow!("Cannot transfer network inputs"))?;
+                transfer
+                    .value()
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                    .context("Cannot transfer network inputs")?;
             }
         }
         self.function
             .execute(self.stream.clone(), &self.buffers)
             .and_then(|value| value.value())
-            .map_err(|_| anyhow::anyhow!("Network inference failed"))?;
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Network inference failed")?;
 
-        let values = self.output.to_host().map_err(|_| anyhow::anyhow!("Cannot read network output"))?;
+        let values = self
+            .output
+            .to_host()
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .context("Cannot read network output")?;
         ensure!(values.f32().len() == batch.len(), "Network returned the wrong number of scores");
 
         Ok(values.f32().to_vec())

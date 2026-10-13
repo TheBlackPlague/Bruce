@@ -104,6 +104,7 @@ dependencies = [
  "bullet-trainer",
  "bullet_lib",
  "clap",
+ "console",
  "crc32c",
  "ctrlc",
  "indicatif",

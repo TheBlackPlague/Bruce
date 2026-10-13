@@ -1,352 +1,182 @@
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, BufWriter, IsTerminal, Write},
-    path::Path,
-    sync::mpsc::{self, SyncSender, TrySendError},
-    thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use bullet_trainer::run::{TrainingEvent, TrainingSteps};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use prost::Message;
+use bullet_trainer::run::{Step, TrainingEvent, TrainingSteps};
 
-use crate::config::Config;
+pub use crate::logging::TensorBoard;
 
-pub struct Reporter
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetricSample
+{
+    pub step: i64,
+    pub loss: f32,
+    pub learning_rate: f32,
+    pub speed: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrainingProgress
+{
+    pub superbatch: usize,
+    pub final_superbatch: usize,
+    pub batch: usize,
+    pub batches_per_superbatch: usize,
+    pub global_batch: usize,
+    pub session_batches: usize,
+    pub loss: Option<f64>,
+    pub loss_batches: usize,
+    pub learning_rate: f32,
+    pub elapsed: Duration,
+    pub positions_per_second: Option<f64>,
+    pub superbatch_eta: Option<Duration>,
+    pub run_eta: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Observation
+{
+    pub progress: Option<TrainingProgress>,
+    pub sample: Option<MetricSample>,
+}
+
+#[derive(Debug)]
+pub struct TrainingMetrics
 {
     steps: TrainingSteps,
     log_every: usize,
     setup: Duration,
-    bar: ProgressBar,
-    plain: bool,
-    last_print: Instant,
-    sender: Option<SyncSender<Report>>,
-    writer: Option<JoinHandle<Result<()>>>,
-    dropped: usize,
+    latest: Option<TrainingProgress>,
     loss_sum: f64,
     loss_batches: usize,
+    run_loss_sum: f64,
+    session_batches: usize,
 }
 
-enum Report
+impl TrainingMetrics
 {
-    Message(String),
-    Sample
+    pub fn new(steps: TrainingSteps, log_every: usize) -> Self
     {
-        step: i64,
-        loss: f32,
-        learning_rate: f32,
-        speed: f32,
-    },
-}
+        Self {
+            steps,
+            log_every: log_every.max(1),
+            setup: Duration::ZERO,
+            latest: None,
+            loss_sum: 0.0,
+            loss_batches: 0,
+            run_loss_sum: 0.0,
+            session_batches: 0,
+        }
+    }
 
-impl Reporter
-{
-    pub fn new(config: &Config, steps: TrainingSteps, plain: bool) -> Result<Self>
+    pub fn observe(&mut self, event: &TrainingEvent) -> Observation
     {
-        fs::create_dir_all("logs").context("Cannot create log directory")?;
-        let mut log = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(Path::new("logs").join(format!("{}.log", config.name)))?,
-        );
+        match event {
+            TrainingEvent::TrainingReady { setup_time, .. } => {
+                self.setup = *setup_time;
+                Observation::default()
+            },
+            TrainingEvent::BatchCompleted { step, loss, learning_rate, elapsed, .. } => {
+                self.batch_completed(*step, *loss, *learning_rate, *elapsed)
+            },
+            TrainingEvent::RunCompleted { elapsed, .. } => {
+                if let Some(mut progress) = self.latest {
+                    progress.elapsed = elapsed.saturating_sub(self.setup);
+                    self.update_rates(&mut progress);
+                    self.latest = Some(progress);
+                }
 
-        writeln!(log, "Training {}", config.name)?;
-        log.flush()?;
+                Observation { progress: self.latest, sample: None }
+            },
+            _ => Observation::default(),
+        }
+    }
 
-        let tensorboard = if config.tensorboard.enabled {
-            match TensorBoard::new(&config.tensorboard.path, &config.name) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    eprintln!("TensorBoard is unavailable: {error}");
-                    None
-                },
-            }
+    pub fn progress(&self) -> Option<TrainingProgress> { self.latest }
+
+    pub fn run_loss(&self) -> Option<f64>
+    {
+        (self.session_batches > 0).then(|| self.run_loss_sum / self.session_batches as f64)
+    }
+
+    pub fn finish(&mut self) -> Option<MetricSample> { self.take_sample() }
+
+    fn batch_completed(&mut self, step: Step, loss: f32, learning_rate: f32, elapsed: Duration) -> Observation
+    {
+        self.loss_sum += f64::from(loss);
+        self.loss_batches += 1;
+        self.run_loss_sum += f64::from(loss);
+        self.session_batches += 1;
+
+        let batch = step.batch() + 1;
+        let mut progress = TrainingProgress {
+            superbatch: step.superbatch(),
+            final_superbatch: step.final_superbatch(),
+            batch,
+            batches_per_superbatch: step.batches_per_superbatch(),
+            global_batch: step.total_batches() + 1,
+            session_batches: self.session_batches,
+            loss: Some(self.loss_sum / self.loss_batches as f64),
+            loss_batches: self.loss_batches,
+            learning_rate,
+            elapsed: elapsed.saturating_sub(self.setup),
+            positions_per_second: None,
+            superbatch_eta: None,
+            run_eta: None,
+        };
+        self.update_rates(&mut progress);
+        self.latest = Some(progress);
+
+        let sample = if batch == 1 || batch == step.batches_per_superbatch() || batch.is_multiple_of(self.log_every) {
+            self.take_sample()
         } else {
             None
         };
 
-        let (sender, receiver) = mpsc::sync_channel(256);
+        Observation { progress: Some(progress), sample }
+    }
 
-        let writer = thread::spawn(move || -> Result<()> {
-            let mut tensorboard = tensorboard;
-            let mut flushed = Instant::now();
-            loop {
-                match receiver.recv_timeout(Duration::from_secs(5).saturating_sub(flushed.elapsed())) {
-                    Ok(Report::Message(message)) => writeln!(log, "{message}")?,
-                    Ok(Report::Sample { step, loss, learning_rate, speed }) => {
-                        writeln!(log, "Batch {step}: loss {loss:.6}, lr {learning_rate:.3e}, {speed:.3} Mpos/s")?;
-                        tensorboard_action(&mut tensorboard, |writer| writer.sample(step, loss, learning_rate, speed));
-                    },
-                    Err(mpsc::RecvTimeoutError::Timeout) => {},
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+    fn update_rates(&self, progress: &mut TrainingProgress)
+    {
+        let seconds = progress.elapsed.as_secs_f64();
+        let batches_per_second = progress.session_batches as f64 / seconds;
+        if seconds <= 0.0 || !batches_per_second.is_finite() || batches_per_second <= 0.0 {
+            progress.positions_per_second = None;
+            progress.superbatch_eta = None;
+            progress.run_eta = None;
+            return;
+        }
 
-                if flushed.elapsed() >= Duration::from_secs(5) {
-                    log.flush()?;
-                    tensorboard_action(&mut tensorboard, TensorBoard::flush);
-                    flushed = Instant::now();
-                }
-            }
-            log.flush()?;
+        let positions_per_second = batches_per_second * self.steps.batch_size as f64;
+        progress.positions_per_second = positions_per_second.is_finite().then_some(positions_per_second);
 
-            tensorboard_action(&mut tensorboard, TensorBoard::flush);
+        let superbatch_remaining = progress.batches_per_superbatch.saturating_sub(progress.batch);
+        let run_remaining = progress
+            .final_superbatch
+            .saturating_sub(progress.superbatch)
+            .saturating_mul(progress.batches_per_superbatch)
+            .saturating_add(superbatch_remaining);
+        progress.superbatch_eta = Duration::try_from_secs_f64(superbatch_remaining as f64 / batches_per_second).ok();
+        progress.run_eta = Duration::try_from_secs_f64(run_remaining as f64 / batches_per_second).ok();
+    }
 
-            Ok(())
-        });
+    fn take_sample(&mut self) -> Option<MetricSample>
+    {
+        if self.loss_batches == 0 {
+            return None;
+        }
 
-        let plain = plain
-            || !io::stderr().is_terminal()
-            || !io::stdout().is_terminal()
-            || std::env::var_os("CI").is_some()
-            || std::env::var("TERM").is_ok_and(|term| term == "dumb");
+        let progress = self.latest?;
+        let loss = (self.loss_sum / self.loss_batches as f64) as f32;
 
-        let target = if plain { ProgressDrawTarget::hidden() } else { ProgressDrawTarget::stderr_with_hz(10) };
-        let bar = ProgressBar::with_draw_target(Some(steps.batches_per_superbatch as u64), target);
-        bar.set_style(ProgressStyle::with_template("{wide_msg}")?);
+        self.loss_sum = 0.0;
+        self.loss_batches = 0;
 
-        Ok(Self {
-            steps,
-            log_every: config.training.log_every,
-            setup: Duration::ZERO,
-            bar,
-            plain,
-            last_print: Instant::now(),
-            sender: Some(sender),
-            writer: Some(writer),
-            dropped: 0,
-            loss_sum: 0.0,
-            loss_batches: 0,
+        Some(MetricSample {
+            step: i64::try_from(progress.global_batch).ok()?,
+            loss,
+            learning_rate: progress.learning_rate,
+            speed: (progress.positions_per_second.unwrap_or(0.0) / 1e6) as f32,
         })
     }
-
-    pub fn message(&mut self, message: &str)
-    {
-        let message: String = message.chars().filter(|ch| !ch.is_control()).collect();
-        if self.plain {
-            eprintln!("{message}");
-        } else {
-            self.bar.println(&message);
-        }
-
-        self.send(Report::Message(message));
-    }
-
-    pub fn on_event(&mut self, event: &TrainingEvent)
-    {
-        match event {
-            TrainingEvent::RunStarted { device_name, .. } => self.message(&format!("Training on {device_name}")),
-            TrainingEvent::TrainingReady { setup_time, .. } => {
-                self.setup = *setup_time;
-                self.message("Training started");
-            },
-            TrainingEvent::BatchCompleted { step, loss, learning_rate, elapsed, .. } => {
-                self.loss_sum += f64::from(*loss);
-                self.loss_batches += 1;
-
-                let batch = step.batch() + 1;
-                if batch != 1 && batch != step.batches_per_superbatch() && !batch.is_multiple_of(self.log_every) {
-                    return;
-                }
-
-                let loss = (self.loss_sum / self.loss_batches as f64) as f32;
-                self.loss_sum = 0.0;
-                self.loss_batches = 0;
-
-                let global_batch = step.total_batches() + 1;
-                let completed = global_batch - self.steps.start_batch();
-                let seconds = elapsed.saturating_sub(self.setup).as_secs_f64();
-                let batches_per_second = completed as f64 / seconds.max(f64::EPSILON);
-                let speed = (batches_per_second * self.steps.batch_size as f64 / 1e6) as f32;
-                let remaining = (step.final_superbatch() - step.superbatch()) * step.batches_per_superbatch()
-                    + step.batches_per_superbatch()
-                    - batch;
-                let eta = duration(remaining as f64 / batches_per_second);
-                let batch_eta = duration((step.batches_per_superbatch() - batch) as f64 / batches_per_second);
-
-                let message = format!(
-                    "Superbatch {}/{} · {batch}/{} · loss {loss:.6} · lr {learning_rate:.3e} · {speed:.2} Mpos/s · \
-                     elapsed {} · ETA {batch_eta} · Total ETA {eta}",
-                    step.superbatch(),
-                    step.final_superbatch(),
-                    step.batches_per_superbatch(),
-                    duration(seconds),
-                );
-
-                self.bar.set_position(batch as u64);
-                if self.plain {
-                    if batch == 1 || self.last_print.elapsed() >= Duration::from_secs(5) {
-                        eprintln!("{message}");
-                        self.last_print = Instant::now();
-                    }
-                } else {
-                    self.bar.set_message(message);
-                }
-
-                if let Ok(step) = i64::try_from(global_batch) {
-                    self.send(Report::Sample { step, loss, learning_rate: *learning_rate, speed });
-                }
-            },
-            TrainingEvent::SuperbatchCompleted { step, loss, .. } => {
-                self.message(&format!("Superbatch {} complete · loss {loss:.6}", step.superbatch()));
-            },
-            TrainingEvent::RunCompleted { .. } => self.message("Training complete"),
-            _ => {},
-        }
-    }
-
-    fn send(&mut self, report: Report)
-    {
-        if let Some(sender) = &self.sender {
-            match sender.try_send(report) {
-                Ok(()) => {},
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => self.dropped += 1,
-            }
-        }
-    }
-
-    pub fn finish(&mut self) -> Result<()>
-    {
-        self.sender.take();
-        self.bar.finish_and_clear();
-
-        if let Some(writer) = self.writer.take() {
-            match writer.join() {
-                Ok(Ok(())) => {},
-                Ok(Err(error)) => eprintln!("Reporting stopped: {error}"),
-                Err(_) => eprintln!("Reporting stopped unexpectedly"),
-            }
-        }
-
-        if self.dropped > 0 {
-            eprintln!("Reporting skipped {} updates", self.dropped);
-            self.dropped = 0;
-        }
-
-        Ok(())
-    }
-}
-
-fn tensorboard_action(writer: &mut Option<TensorBoard>, action: impl FnOnce(&mut TensorBoard) -> Result<()>)
-{
-    if let Some(active) = writer
-        && let Err(error) = action(active)
-    {
-        eprintln!("TensorBoard reporting stopped: {error}");
-        *writer = None;
-    }
-}
-
-impl Drop for Reporter
-{
-    fn drop(&mut self) { let _ = self.finish(); }
-}
-
-fn duration(seconds: f64) -> String
-{
-    if !seconds.is_finite() || seconds < 0.0 {
-        return "--:--:--".into();
-    }
-    let seconds = seconds as u64;
-    format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
-}
-
-pub struct TensorBoard
-{
-    writer: BufWriter<File>,
-}
-
-impl TensorBoard
-{
-    pub fn new(root: &Path, name: &str) -> Result<Self>
-    {
-        anyhow::ensure!(
-            !name.is_empty() && name.bytes().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_')),
-            "Invalid run name"
-        );
-
-        let directory = root.join(name);
-        fs::create_dir_all(&directory)?;
-
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = directory.join(format!("events.out.tfevents.{timestamp}.{}.bruce", std::process::id()));
-
-        let mut result = Self { writer: BufWriter::new(File::create_new(path)?) };
-        result.write(Event { file_version: Some("brain.Event:2".into()), ..event(0) })?;
-        result.flush()?;
-
-        Ok(result)
-    }
-
-    pub fn sample(&mut self, step: i64, loss: f32, learning_rate: f32, speed: f32) -> Result<()>
-    {
-        let values =
-            [("train/loss", loss), ("train/learning_rate", learning_rate), ("performance/mpos_per_second", speed)]
-                .into_iter()
-                .filter(|(_, value)| value.is_finite())
-                .map(|(tag, simple_value)| Value { tag: tag.into(), simple_value })
-                .collect();
-
-        self.write(Event { summary: Some(Summary { value: values }), ..event(step) })
-    }
-
-    fn write(&mut self, event: Event) -> Result<()>
-    {
-        let data = event.encode_to_vec();
-        let length = (data.len() as u64).to_le_bytes();
-
-        self.writer.write_all(&length)?;
-        self.writer.write_all(&checksum(&length))?;
-        self.writer.write_all(&data)?;
-        self.writer.write_all(&checksum(&data))?;
-
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<()> { self.writer.flush().context("Cannot flush TensorBoard events") }
-}
-
-fn checksum(bytes: &[u8]) -> [u8; 4] { crc32c::crc32c(bytes).rotate_right(15).wrapping_add(0xa282_ead8).to_le_bytes() }
-
-fn event(step: i64) -> Event
-{
-    Event {
-        wall_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-        step,
-        file_version: None,
-        summary: None,
-    }
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct Event
-{
-    #[prost(double, tag = "1")]
-    wall_time: f64,
-    #[prost(int64, tag = "2")]
-    step: i64,
-    #[prost(string, optional, tag = "3")]
-    file_version: Option<String>,
-    #[prost(message, optional, tag = "5")]
-    summary: Option<Summary>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct Summary
-{
-    #[prost(message, repeated, tag = "1")]
-    value: Vec<Value>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct Value
-{
-    #[prost(string, tag = "1")]
-    tag: String,
-    #[prost(float, tag = "2")]
-    simple_value: f32,
 }
 
 #[cfg(test)]

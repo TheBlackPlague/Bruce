@@ -145,3 +145,39 @@ fn nonfinite_optimizer_state_is_never_published()
     let path = checkpoints.save(&trainer, &architecture.saved_format(), 1).unwrap();
     assert_eq!(checkpoints.inspect(&path).unwrap(), 1);
 }
+
+#[test]
+fn legacy_metadata_allows_reporting_changes_but_rejects_numerical_changes()
+{
+    let root = tempfile::tempdir().unwrap();
+    let mut config = fixture(root.path());
+    let architecture: Architecture = config.architecture.parse().unwrap();
+    let original = optimiser(architecture, config.seed);
+    let path = Checkpoints::new(&config).unwrap().save(&original, &architecture.saved_format(), 1).unwrap();
+
+    let manifest_path = path.join("checkpoint.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["configuration"]["training"]["log_every"] = 32.into();
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    config.training.log_every = 7;
+    config.tensorboard.enabled = !config.tensorboard.enabled;
+    config.tensorboard.path = root.path().join("other-events");
+    assert_eq!(Checkpoints::new(&config).unwrap().inspect(&path).unwrap(), 1);
+
+    let original = config.clone();
+    config.seed += 1;
+    assert!(Checkpoints::new(&config).unwrap().inspect(&path).is_err());
+
+    config = original.clone();
+    config.optimizer.decay += 0.01;
+    assert!(Checkpoints::new(&config).unwrap().inspect(&path).is_err());
+
+    config = original.clone();
+    config.data.batch_size += 1;
+    assert!(Checkpoints::new(&config).unwrap().inspect(&path).is_err());
+
+    config = original.clone();
+    config.training.checkpoint.location = root.path().join("other-checkpoints");
+    assert!(Checkpoints::new(&config).unwrap().inspect(&path).is_err());
+}

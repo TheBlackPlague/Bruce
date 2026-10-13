@@ -124,6 +124,7 @@ fn reporting_changes_do_not_invalidate_resume()
     let before = config.checkpoint_value();
     config.tensorboard.path = PathBuf::from("another-directory");
     config.tensorboard.enabled = !config.tensorboard.enabled;
+    config.training.log_every = 1;
     assert_eq!(config.checkpoint_value(), before);
 }
 
