@@ -4,13 +4,24 @@ use console::{Style, measure_text_width, truncate_str};
 
 use super::{Outcome, Progress, State, clean_display_text, wrap};
 
-const SHARK: [&str; 6] = [
-    "           ▄█",
-    "▄       ▄▄███▄▄▄▄▄",
-    "██▄▄▄█████████▀█████▀▄▄",
-    "██▀▀▀█████████▄██████▀▀▀▀",
-    "▀       ▀▀█████▀▀▀▀",
-    "           ▀█▀",
+const SHARK: [&str; 17] = [
+    "                                        ██▄",
+    "                                        ███▄",
+    "                                       ▄████▄",
+    "                               ▄▄▄▄▄▄███████████▄▄▄▄▄",
+    "                        ▄▄██████████████████████████████▄",
+    "█▄                 ▄▄████████████████████████████████▪█████▄",
+    " ███▄          ▄▄████████████████████████████████████████████▄",
+    "  █████▄▄▄▄▄▄██████████████████████████████████████████████████",
+    "   ▀██████████████████████████████████████████████▀▀███▀▀███▀▀",
+    "   ▄██████▀▀▀▀███████████████████████████████████   █▀   █▀",
+    "   ████▀         ▀▀▀▀████████████████████████████",
+    " ███▀                  ▀▀▀███████████████████████▄  █▄",
+    " █▀                          ▀▀▀███████████████████▄███▄▄▄",
+    "                                   ▀▀██████████████████▀▀",
+    "                                       ▄██████▀▀▀",
+    "                                     ▄████▀",
+    "                                     █▀▀",
 ];
 
 struct Layout
@@ -61,26 +72,38 @@ impl Layout
         let device = state.contexts.iter().find(|(label, _)| label == "Device").map(|(_, value)| value.as_str());
 
         if mascot {
-            let right_width = self.width.saturating_sub(28);
+            let shark_width = mascot_width();
+            let column_start = shark_width + 4;
+            let beside = self.width >= column_start + 20;
+            let identity_width = if beside { self.width - column_start } else { self.width };
             let mut identity_rows = vec![self.strong(title)];
             if live {
-                identity_rows.push(truncate_str(&identity, right_width, "…").into_owned());
+                identity_rows.push(truncate_str(&identity, identity_width, "…").into_owned());
             } else {
-                identity_rows.extend(wrap(&identity, right_width));
+                identity_rows.extend(wrap(&identity, identity_width));
             }
             if let Some(device) = device {
                 if live {
-                    identity_rows.push(self.muted(truncate_str(device, right_width, "…")));
+                    identity_rows.push(self.muted(truncate_str(device, identity_width, "…")));
                 } else {
-                    identity_rows.extend(wrap(device, right_width).into_iter().map(|line| self.muted(line)));
+                    identity_rows.extend(wrap(device, identity_width).into_iter().map(|line| self.muted(line)));
                 }
+            }
+
+            if !beside {
+                self.rows.extend(identity_rows);
+                self.blank();
+                for row in SHARK {
+                    self.rows.push(self.accent(row));
+                }
+                return;
             }
 
             let count = SHARK.len().max(identity_rows.len());
             for index in 0..count {
                 let shark = SHARK.get(index).copied().unwrap_or("");
                 let right = identity_rows.get(index).map(String::as_str).unwrap_or("");
-                let padding = " ".repeat(28_usize.saturating_sub(measure_text_width(shark)));
+                let padding = " ".repeat(column_start.saturating_sub(measure_text_width(shark)));
                 self.rows.push(format!("{}{padding}{right}", self.accent(shark)));
             }
         } else if compact {
@@ -186,8 +209,19 @@ impl Layout
 pub(super) fn active(state: &State, width: usize, height: usize) -> Vec<String>
 {
     let budget = height.saturating_sub(1).max(1);
+    let mascot = width >= mascot_width() && height > SHARK.len();
+    let mut rows = active_rows(state, width, height, mascot);
+    if mascot && rows.len() > budget {
+        rows = active_rows(state, width, height, false);
+    }
+    rows.truncate(budget);
+    rows
+}
+
+fn active_rows(state: &State, width: usize, height: usize, mascot: bool) -> Vec<String>
+{
+    let budget = height.saturating_sub(1).max(1);
     let compact = height < 20;
-    let mascot = width >= 70 && height >= 22;
     let mut layout = Layout::new(width, state.renderer.policy.color);
     layout.header(state, mascot, compact, true);
 
@@ -293,14 +327,13 @@ pub(super) fn active(state: &State, width: usize, height: usize) -> Vec<String>
         }
     }
 
-    layout.rows.truncate(budget);
     layout.rows
 }
 
 pub(super) fn completed(state: &State, outcome: Outcome, width: usize, rich_output: bool) -> Vec<String>
 {
     let mut layout = Layout::new(width, state.renderer.policy.color);
-    layout.header(state, width >= 70, false, false);
+    layout.header(state, width >= mascot_width(), false, false);
     layout.blank();
 
     let outcome_label = match outcome {
@@ -375,6 +408,8 @@ pub(super) fn completed(state: &State, outcome: Outcome, width: usize, rich_outp
     }
     layout.rows
 }
+
+fn mascot_width() -> usize { SHARK.iter().map(|row| measure_text_width(row)).max().unwrap_or(0) }
 
 fn number(value: u64) -> String
 {

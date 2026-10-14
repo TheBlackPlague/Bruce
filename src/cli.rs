@@ -1269,7 +1269,7 @@ mod tests
         }));
         let state = lock(&reporter.owner.shared.state);
 
-        for (width, height) in [(78, 24), (46, 24), (38, 12)] {
+        for (width, height) in [(100, 40), (78, 40), (78, 24), (62, 40), (46, 24), (38, 12)] {
             let rows = layout::active(&state, width, height);
             assert!(rows.len() < height, "{rows:?}");
             assert!(rows.iter().all(|row| measure_text_width(row) <= width), "{rows:?}");
@@ -1290,7 +1290,7 @@ mod tests
                 assert!(text.contains(label), "{label} missing at {width}x{height}: {text}");
             }
             assert!(!text.contains("Mean of") && !text.contains("Session average"));
-            assert_eq!(text.contains(SHARK_TEST_MARKER), width >= 70);
+            assert_eq!(text.contains(SHARK_TEST_MARKER), width >= 63 && height >= 40);
             if width >= 46 {
                 assert!(text.contains("aurora"));
                 assert!(text.matches('━').count() + text.matches('─').count() > 0);
@@ -1298,7 +1298,78 @@ mod tests
         }
     }
 
-    const SHARK_TEST_MARKER: &str = "██▄▄▄█████████▀█████▀▄▄";
+    const SHARK_TEST_MARKER: &str = "▀▀███▀▀███▀▀";
+
+    #[test]
+    fn mascot_requires_room_for_the_entire_frame()
+    {
+        let (reporter, _) = captured_reporter(Verbosity::Quiet);
+
+        reporter.start("convert", "dataset");
+        reporter.phase("Converting positions");
+        reporter.progress(Progress::Work { completed: 12582912, total: None, unit: "positions" });
+
+        let state = lock(&reporter.owner.shared.state);
+
+        for width in [63, 86, 87, 100] {
+            let full_frame = layout::active(&state, width, 60);
+            let required_height = full_frame.len() + 1;
+            assert!(full_frame.join("\n").contains(SHARK_TEST_MARKER));
+
+            for height in [required_height - 1, required_height] {
+                let rows = layout::active(&state, width, height);
+                let text = rows.join("\n");
+
+                assert!(rows.len() < height);
+                assert!(rows.iter().all(|row| measure_text_width(row) <= width));
+                assert_eq!(text.contains(SHARK_TEST_MARKER), height == required_height);
+                for label in ["Bruce 0.3.0", "12,582,912 positions", "Elapsed", "ctrl+c  cancel"] {
+                    assert!(text.contains(label), "{label} missing at {width}x{height}: {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_mascot_preserves_the_approved_right_facing_art()
+    {
+        let (reporter, _) = captured_reporter(Verbosity::Quiet);
+        reporter.start("convert", "dataset");
+
+        let state = lock(&reporter.owner.shared.state);
+        let approved = [
+            "                                        ██▄",
+            "                                        ███▄",
+            "                                       ▄████▄",
+            "                               ▄▄▄▄▄▄███████████▄▄▄▄▄",
+            "                        ▄▄██████████████████████████████▄",
+            "█▄                 ▄▄████████████████████████████████▪█████▄",
+            " ███▄          ▄▄████████████████████████████████████████████▄",
+            "  █████▄▄▄▄▄▄██████████████████████████████████████████████████",
+            "   ▀██████████████████████████████████████████████▀▀███▀▀███▀▀",
+            "   ▄██████▀▀▀▀███████████████████████████████████   █▀   █▀",
+            "   ████▀         ▀▀▀▀████████████████████████████",
+            " ███▀                  ▀▀▀███████████████████████▄  █▄",
+            " █▀                          ▀▀▀███████████████████▄███▄▄▄",
+            "                                   ▀▀██████████████████▀▀",
+            "                                       ▄██████▀▀▀",
+            "                                     ▄████▀",
+            "                                     █▀▀",
+        ];
+
+        for width in [62, 63, 86, 87, 100] {
+            let rows = layout::completed(&state, Outcome::Success, width, true);
+            assert!(rows.iter().all(|row| measure_text_width(row) <= width));
+            assert_eq!(rows.join("\n").contains(SHARK_TEST_MARKER), width >= 63);
+
+            if width >= 63 {
+                let first = rows.iter().position(|row| row.starts_with(approved[0])).unwrap();
+                for (row, expected) in rows[first..].iter().zip(approved) {
+                    assert!(row.starts_with(expected), "Mascot row changed: {row:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn retained_work_does_not_invent_a_total_and_errors_stay_in_one_frame()
