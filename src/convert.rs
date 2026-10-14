@@ -42,18 +42,25 @@ use crate::{
 };
 
 #[derive(Debug, Args)]
+#[command(after_help = "Example:\n  bruce convert --from text --to bullet --input positions.txt --output \
+                        positions.bullet --separator ';'")]
 pub struct Options
 {
     #[arg(long, value_enum)]
     pub from: Format,
+
     #[arg(long, value_enum)]
     pub to: Format,
+
     #[arg(long)]
     pub input: PathBuf,
+
     #[arg(long)]
     pub output: PathBuf,
+
     #[arg(long)]
     pub separator: Option<String>,
+
     #[arg(long)]
     pub threads: Option<usize>,
 }

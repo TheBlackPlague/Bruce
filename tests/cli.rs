@@ -13,6 +13,10 @@ fn exposes_three_workloads_and_resume()
         assert!(text.contains(command));
     }
 
+    assert!(text.contains("Train a network"));
+    assert!(text.contains("Convert a dataset"));
+    assert!(text.contains("Inspect dataset statistics"));
+
     let help = bruce(&["train", "--help"]);
     assert!(help.status.success());
     let text = String::from_utf8(help.stdout).unwrap();
@@ -20,6 +24,9 @@ fn exposes_three_workloads_and_resume()
     for option in ["--check", "--resume", "--tensorboard-dir", "--plain"] {
         assert!(text.contains(option));
     }
+
+    assert!(text.contains("Validate configuration and datasets without training"));
+    assert!(text.contains("Examples:"));
 }
 
 #[test]
@@ -77,12 +84,20 @@ fn conversion_and_analysis_commands_write_reports_and_session_logs()
         .unwrap();
     assert!(convert.status.success(), "{}", String::from_utf8_lossy(&convert.stderr));
 
+    let input_bytes = std::fs::metadata(directory.path().join("input.txt")).unwrap().len();
+    let output_bytes = std::fs::metadata(directory.path().join("output.bullet")).unwrap().len();
+    assert_eq!(
+        String::from_utf8(convert.stdout).unwrap(),
+        format!("Converted 1 positions ({input_bytes} bytes to {output_bytes} bytes; 0 skipped)\n")
+    );
+
     let analyze = Command::new(env!("CARGO_BIN_EXE_bruce"))
         .current_dir(directory.path())
         .args(["analyze", "--format", "bullet", "--input", "output.bullet", "--output", "report.json"])
         .output()
         .unwrap();
     assert!(analyze.status.success(), "{}", String::from_utf8_lossy(&analyze.stderr));
+    assert_eq!(String::from_utf8(analyze.stdout).unwrap(), "1 positions; score range 125 to 125 cp; mean 125.0 cp\n");
 
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.path().join("report.json")).unwrap()).unwrap();

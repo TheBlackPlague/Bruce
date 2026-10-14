@@ -238,7 +238,7 @@ pub fn run_reported(
 
                 match checkpoints.save(trainer, &saved_format, superbatch) {
                     Ok(path) => {
-                        reporter.notice(&format!("Checkpoint saved: {}", path.display()));
+                        reporter.context("Latest checkpoint", path.to_string_lossy());
                         *latest_checkpoint.borrow_mut() = Some(path);
                     },
                     Err(error) => {
@@ -272,7 +272,7 @@ pub fn run_reported(
     }
 
     if let Some(loss) = metrics.run_loss() {
-        reporter.notice(&format!("Session mean loss: {loss:.6}"));
+        reporter.set_training_loss(loss);
     }
 
     if let Some(path) = &*latest_checkpoint.borrow() {
@@ -300,7 +300,7 @@ fn report_training_event(event: &TrainingEvent, metrics: &mut TrainingMetrics, r
         TrainingEvent::RunStarted { device_name, .. } => reporter.context("Device", device_name),
         TrainingEvent::TrainingReady { .. } => reporter.phase("Training"),
         TrainingEvent::SuperbatchCompleted { step, loss, .. } => {
-            reporter.notice(&format!("Superbatch {} complete: mean loss {loss:.6}", step.superbatch()))
+            reporter.verbose(&format!("Superbatch {} complete: mean loss {loss:.6}", step.superbatch()))
         },
         TrainingEvent::RunCompleted { .. } => reporter.phase("Finalizing training"),
         _ => {},

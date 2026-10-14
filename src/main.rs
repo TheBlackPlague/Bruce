@@ -1,5 +1,4 @@
 use std::{
-    io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     process::ExitCode,
@@ -14,31 +13,42 @@ use anyhow::{Context, Result};
 use bruce::{
     analyze,
     architecture::Architecture,
-    cli::{Cancelled, ColorMode, DisplayMode, Outcome, OutputOptions, Reporter, Verbosity},
+    cli::{Cancelled, ColorMode, CommandOutput, DisplayMode, Outcome, OutputOptions, Reporter, Verbosity},
     config::{Config, DataSource},
     convert,
     data::Format,
     logging::Logger,
     train,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "bruce", version, about = "Neural Network Training Interface & Tools for StockDory")]
+#[command(
+    name = "bruce",
+    version,
+    about = "Neural network training and dataset tools for StockDory",
+    after_help = "Start with: bruce train --check\nUse bruce <COMMAND> --help for options and examples."
+)]
 struct Cli
 {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Display options")]
     plain: bool,
-    #[arg(long, global = true, value_enum, default_value = "auto")]
+
+    #[arg(long, global = true, value_enum, default_value = "auto", help_heading = "Display options")]
     display: DisplayMode,
-    #[arg(long, global = true, value_enum, default_value = "normal")]
+
+    #[arg(long, global = true, value_enum, default_value = "normal", help_heading = "Display options")]
     verbosity: Verbosity,
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
+
+    #[arg(short, long, global = true, conflicts_with = "verbose", help_heading = "Display options")]
     quiet: bool,
-    #[arg(short, long, global = true, conflicts_with = "quiet")]
+
+    #[arg(short, long, global = true, conflicts_with = "quiet", help_heading = "Display options")]
     verbose: bool,
-    #[arg(long, global = true, value_enum, default_value = "auto")]
+
+    #[arg(long, global = true, value_enum, default_value = "auto", help_heading = "Display options")]
     color: ColorMode,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -47,42 +57,59 @@ struct Cli
 enum Command
 {
     Train(TrainOptions),
+
     Convert(convert::Options),
+
     Analyze(AnalyzeOptions),
 }
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  bruce train --check\n  bruce train --config config/training.toml\n  bruce train \
+                        --resume checkpoints/run-10")]
 struct TrainOptions
 {
     #[arg(short, long, default_value = "config/training.toml")]
     config: PathBuf,
+
     #[arg(long, conflicts_with = "check")]
     resume: Option<PathBuf>,
+
     #[arg(long)]
     check: bool,
+
     #[arg(long)]
     tensorboard_dir: Option<PathBuf>,
+
     #[arg(long)]
     log_every: Option<usize>,
 }
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  bruce analyze --format bullet --input positions.bullet\n  bruce analyze \
+                        --format bullet --input positions.bullet --limit 100000 --output report.json")]
 struct AnalyzeOptions
 {
     #[arg(long, value_enum)]
     format: Format,
+
     #[arg(long)]
     input: PathBuf,
+
     #[arg(long)]
     separator: Option<String>,
+
     #[arg(long)]
     network: Option<PathBuf>,
+
     #[arg(long, value_enum, requires = "network")]
     arch: Option<Architecture>,
+
     #[arg(long, default_value_t = 0)]
     gpu: i32,
+
     #[arg(long)]
     limit: Option<u64>,
+
     #[arg(long)]
     output: Option<PathBuf>,
 }
@@ -163,11 +190,11 @@ fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
 
             reporter.context("Input", options.input.to_string_lossy());
             reporter.context("Output", options.output.to_string_lossy());
+            reporter.context("Format", format!("{} → {}", format_name(options.from), format_name(options.to)));
 
-            let summary = convert::run_reported(&options, reporter, stop)?.to_string();
-            reporter.verbose(&summary);
-
-            write_result(&summary)?;
+            let summary = convert::run_reported(&options, reporter, stop)?;
+            reporter.verbose(&summary.to_string());
+            reporter.set_output(CommandOutput::conversion(&summary));
 
             Ok(Outcome::Success)
         },
@@ -175,6 +202,15 @@ fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
         Command::Analyze(options) => {
             attach_log(reporter, None, None)?;
             reporter.context("Input", options.input.to_string_lossy());
+            reporter.context("Format", format_name(options.format));
+
+            if let Some(path) = &options.network {
+                reporter.context("Network", path.to_string_lossy());
+            }
+
+            if let Some(limit) = options.limit {
+                reporter.context("Limit", format!("{limit} positions"));
+            }
 
             let report = analyze::run_reported(
                 &analyze::Options {
@@ -194,10 +230,8 @@ fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
                 reporter.context("Report", path.to_string_lossy());
             }
 
-            let summary = report.summary();
-            reporter.verbose(&summary);
-
-            write_result(&summary)?;
+            reporter.verbose(&report.summary());
+            reporter.set_output(CommandOutput::analysis(&report));
 
             Ok(Outcome::Success)
         },
@@ -208,7 +242,7 @@ fn run_training(options: TrainOptions, reporter: &Reporter, stop: Arc<AtomicBool
 {
     reporter.phase("Reading configuration");
     reporter.context("Config", options.config.to_string_lossy());
-    
+
     let mut config = match Config::load(&options.config) {
         Ok(config) => config,
         Err(error) => {
@@ -246,7 +280,7 @@ fn run_training(options: TrainOptions, reporter: &Reporter, stop: Arc<AtomicBool
     if options.check {
         let outcome = train::check_reported(&config, reporter, stop)?;
         if outcome == Outcome::Success {
-            write_result("Configuration and datasets checked")?;
+            reporter.set_output(CommandOutput::check());
         }
         Ok(outcome)
     } else {
@@ -275,11 +309,9 @@ fn attach_log(reporter: &Reporter, path: Option<PathBuf>, tensorboard: Option<(&
     Ok(())
 }
 
-fn write_result(summary: &str) -> Result<()>
+fn format_name(format: Format) -> String
 {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{summary}").context("Could not write the command result; check the receiving pipe")?;
-    stdout.flush().context("Could not flush the command result")
+    format.to_possible_value().expect("Every dataset format has a CLI name").get_name().to_owned()
 }
 
 fn recovery(task: &str) -> &'static str
