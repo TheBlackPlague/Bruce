@@ -182,6 +182,7 @@ impl Checkpoints
         let mut file = File::create(temporary.path().join("checkpoint.json"))?;
         file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
         file.sync_all()?;
+        drop(file);
 
         sync_directory(&state)?;
         sync_directory(temporary.path())?;
