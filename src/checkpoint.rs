@@ -230,13 +230,12 @@ fn validate_files(path: &Path, manifest: &Manifest, architecture: Architecture) 
         ensure!(manifest.files.contains_key(&format!("optimiser_state/{name}")), "Checkpoint is incomplete");
     }
 
-    ensure!(
-        manifest.files.keys().any(|name| name
-            .to_ascii_lowercase()
-            .starts_with(&format!("{}-", architecture.name().to_ascii_lowercase()))
-            && name.ends_with(".nnue")),
-        "Checkpoint has no exported network"
-    );
+    let network_prefix = format!("{}-", architecture.name().to_ascii_lowercase());
+    let has_exported_network = manifest
+        .files
+        .keys()
+        .any(|name| name.to_ascii_lowercase().starts_with(&network_prefix) && name.ends_with(".nnue"));
+    ensure!(has_exported_network, "Checkpoint has no exported network");
 
     for (name, expected) in &manifest.files {
         ensure!(
@@ -258,8 +257,17 @@ fn validate_state(path: &Path, weights: &ModelWeights) -> Result<()>
 {
     let mut expected: BTreeMap<_, _> =
         weights.iter().map(|(name, value)| (name.as_str(), value.values.size())).collect();
-    let size: usize =
-        expected.iter().map(|(name, count)| name.len() + 1 + size_of::<usize>() + count * size_of::<f32>()).sum();
+    
+    let size: usize = expected
+        .iter()
+        .map(|(name, count)| {
+            let name_bytes = name.len() + 1;
+            let count_bytes = size_of::<usize>();
+            let value_bytes = count * size_of::<f32>();
+
+            name_bytes + count_bytes + value_bytes
+        })
+        .sum();
 
     let file = File::open(path)?;
     ensure!(file.metadata()?.len() == size as u64, "Invalid checkpoint state");
@@ -270,21 +278,19 @@ fn validate_state(path: &Path, weights: &ModelWeights) -> Result<()>
 
     let mut remaining = bytes.as_slice();
     while !remaining.is_empty() {
-        let end = remaining.iter().position(|byte| *byte == b'\n').context("Invalid checkpoint state")?;
+        let name_end = remaining.iter().position(|byte| *byte == b'\n').context("Invalid checkpoint state")?;
 
-        let name = std::str::from_utf8(&remaining[..end]).context("Invalid checkpoint state")?;
+        let name = std::str::from_utf8(&remaining[..name_end]).context("Invalid checkpoint state")?;
         let count = expected.remove(name).context("Invalid checkpoint tensor")?;
 
-        remaining = &remaining[end + 1..];
-        let length = remaining.get(..size_of::<usize>()).context("Invalid checkpoint state")?;
-        ensure!(usize::from_le_bytes(length.try_into()?) == count, "Invalid checkpoint tensor size");
+        remaining = &remaining[name_end + 1..];
+        let count_bytes = remaining.get(..size_of::<usize>()).context("Invalid checkpoint state")?;
+        ensure!(usize::from_le_bytes(count_bytes.try_into()?) == count, "Invalid checkpoint tensor size");
 
         remaining = &remaining[size_of::<usize>()..];
         let values = remaining.get(..count * size_of::<f32>()).context("Invalid checkpoint state")?;
-        ensure!(
-            values.as_chunks::<4>().0.iter().all(|value| f32::from_le_bytes(*value).is_finite()),
-            "Checkpoint contains invalid values"
-        );
+        let all_finite = values.as_chunks::<4>().0.iter().all(|value| f32::from_le_bytes(*value).is_finite());
+        ensure!(all_finite, "Checkpoint contains invalid values");
 
         remaining = &remaining[values.len()..];
     }

@@ -19,9 +19,9 @@ use bullet_lib::game::formats::{
         self, TrainingDataEntry,
         chess::{
             coords::Square,
+            r#move::{Move as SfMove, MoveType},
             piece::Piece,
             piecetype::PieceType,
-            r#move::{Move as SfMove, MoveType},
         },
     },
     viriformat::{
@@ -29,7 +29,7 @@ use bullet_lib::game::formats::{
             CHESS960,
             board::{Board, DrawType, GameOutcome, WinType, movegen::MoveList},
             chessmove::Move,
-        }, 
+        },
         dataformat::Game,
     },
 };
@@ -160,45 +160,8 @@ fn run_inner(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Resul
         Summary { positions: 0, skipped: 0, input_bytes: std::fs::metadata(&options.input)?.len(), output_bytes: 0 };
 
     if options.from == options.to {
-        reporter.phase("Checking positions before copying");
-
-        let mut validated: u64 = 0;
-        let (positions, skipped) = data::visit_counted_stoppable(&source, stop, |_| {
-            check_cancelled(stop)?;
-            validated += 1;
-            if validated.is_multiple_of(8192) {
-                reporter.progress(Progress::Work { completed: validated, total: None, unit: "positions checked" });
-            }
-            Ok(false)
-        })?;
-
-        summary.positions = positions + skipped;
-        reporter.progress(Progress::Work { completed: summary.positions, total: None, unit: "positions checked" });
-
-        check_cancelled(stop)?;
-        reporter.phase("Copying validated dataset");
-
-        let mut reader = File::open(&options.input)?;
-        let mut buffer = [0; 64 * 1024];
-        let mut copied = 0;
-
-        loop {
-            check_cancelled(stop)?;
-
-            let length = reader.read(&mut buffer)?;
-            if length == 0 {
-                break;
-            }
-
-            temporary.as_file_mut().write_all(&buffer[..length])?;
-            copied += length as u64;
-
-            reporter.progress(Progress::Work {
-                completed: copied,
-                total: Some(summary.input_bytes),
-                unit: "bytes copied",
-            });
-        }
+        summary.positions =
+            copy_validated_dataset(&source, temporary.as_file_mut(), summary.input_bytes, reporter, stop)?;
     } else {
         reporter.phase("Converting positions");
 
@@ -314,6 +277,53 @@ fn run_inner(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Resul
     Ok(summary)
 }
 
+fn copy_validated_dataset(
+    source: &DataSource,
+    writer: &mut impl Write,
+    input_bytes: u64,
+    reporter: &Reporter,
+    stop: &AtomicBool,
+) -> Result<u64>
+{
+    reporter.phase("Checking positions before copying");
+
+    let mut validated: u64 = 0;
+    let (positions, skipped) = data::visit_counted_stoppable(source, stop, |_| {
+        check_cancelled(stop)?;
+        validated += 1;
+        if validated.is_multiple_of(8192) {
+            reporter.progress(Progress::Work { completed: validated, total: None, unit: "positions checked" });
+        }
+        Ok(false)
+    })?;
+
+    let positions = positions + skipped;
+    reporter.progress(Progress::Work { completed: positions, total: None, unit: "positions checked" });
+
+    check_cancelled(stop)?;
+    reporter.phase("Copying validated dataset");
+
+    let mut reader = File::open(&source.path)?;
+    let mut buffer = [0; 64 * 1024];
+    let mut copied = 0;
+
+    loop {
+        check_cancelled(stop)?;
+
+        let length = reader.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+
+        writer.write_all(&buffer[..length])?;
+        copied += length as u64;
+
+        reporter.progress(Progress::Work { completed: copied, total: Some(input_bytes), unit: "bytes copied" });
+    }
+
+    Ok(positions)
+}
+
 fn write_parallel<T: Sync>(
     items: &[T],
     threads: usize,
@@ -330,12 +340,14 @@ fn write_parallel<T: Sync>(
         return Ok(());
     }
 
-    let chunk_size = items.len().div_ceil(threads.min(items.len()));
+    let worker_count = threads.min(items.len());
+    let chunk_size = items.len().div_ceil(worker_count);
     std::thread::scope(|scope| {
         let encode = &encode;
         let handles = items.chunks(chunk_size).map(|chunk| scope.spawn(move || encode(chunk))).collect::<Vec<_>>();
         for handle in handles {
-            writer.write_all(&handle.join().map_err(|_| anyhow!("Could not encode the dataset"))??)?
+            let bytes = handle.join().map_err(|_| anyhow!("Could not encode the dataset"))??;
+            writer.write_all(&bytes)?
         }
 
         Ok(())
@@ -360,11 +372,7 @@ fn encode(records: &[Record], options: &Options) -> Result<Vec<u8>>
             Format::Bullet => bytes.extend_from_slice(ChessBoard::as_bytes_slice(&[record.board])),
 
             Format::Text => {
-                let fen = record
-                    .fen
-                    .as_deref()
-                    .map(std::borrow::Cow::Borrowed)
-                    .unwrap_or_else(|| std::borrow::Cow::Owned(data::bullet_fen(&record.board)));
+                let fen = record_fen(record);
 
                 let separator = options.separator.as_deref().context("Text conversion needs --separator")?;
 
@@ -427,13 +435,17 @@ fn outcome(result: u8) -> GameOutcome
     }
 }
 
+fn record_fen(record: &Record) -> std::borrow::Cow<'_, str>
+{
+    match &record.fen {
+        Some(fen) => std::borrow::Cow::Borrowed(fen),
+        None => std::borrow::Cow::Owned(data::bullet_fen(&record.board)),
+    }
+}
+
 fn position_move(record: &Record) -> Result<(Board, Move)>
 {
-    let fen = record
-        .fen
-        .as_deref()
-        .map(std::borrow::Cow::Borrowed)
-        .unwrap_or_else(|| std::borrow::Cow::Owned(data::bullet_fen(&record.board)));
+    let fen = record_fen(record);
 
     let board = data::parse_board(&fen).context("Could not convert the position")?;
     if let Some(uci) = &record.next_move {
@@ -545,7 +557,8 @@ fn convert_games<T: Sync>(
 ) -> Result<u64>
 {
     let mut reader = BufReader::new(File::open(&options.input)?);
-    let mut games = Vec::with_capacity(threads * 64);
+    let games_per_batch = threads * 64;
+    let mut games = Vec::with_capacity(games_per_batch);
 
     let mut count = 0;
     while !reader.fill_buf()?.is_empty() {
@@ -554,7 +567,7 @@ fn convert_games<T: Sync>(
         count += positions as u64;
         games.push(game);
 
-        if games.len() == threads * 64 {
+        if games.len() == games_per_batch {
             write_parallel(&games, threads, &encode, writer)?;
             games.clear();
             reporter.progress(Progress::Work { completed: count, total: None, unit: "positions converted" });

@@ -142,9 +142,9 @@ pub fn run_reported(
     let checkpoints = Checkpoints::new(&config)?;
     reporter.phase("Checking checkpoint destinations");
 
-    let completed = resume.as_ref().map(|path| checkpoints.inspect(path)).transpose()?.unwrap_or(0);
+    let completed_superbatches = resume.as_ref().map(|path| checkpoints.inspect(path)).transpose()?.unwrap_or(0);
 
-    for superbatch in completed + 1..=config.training.superbatches {
+    for superbatch in completed_superbatches + 1..=config.training.superbatches {
         if should_save(&config, superbatch) {
             checkpoints.check_destination(superbatch)?;
         }
@@ -189,7 +189,7 @@ pub fn run_reported(
     let steps = TrainingSteps {
         batch_size: config.data.batch_size,
         batches_per_superbatch: BATCHES_PER_SUPERBATCH,
-        start_superbatch: completed + 1,
+        start_superbatch: completed_superbatches + 1,
         end_superbatch: config.training.superbatches,
     };
 
@@ -204,7 +204,9 @@ pub fn run_reported(
     let saved_format = architecture.saved_format();
     let checkpoint_error = RefCell::new(None);
     let nonfinite_loss = Cell::new(false);
-    let saved = RefCell::new(resume);
+    // Bullet invokes these callbacks sequentially. Interior mutability shares failure and checkpoint
+    // state between callbacks without taking ownership away from the final outcome check.
+    let latest_checkpoint = RefCell::new(resume);
 
     reporter.phase("Compiling training and loading first batch");
 
@@ -225,19 +227,19 @@ pub fn run_reported(
         },
         |trainer, step| {
             let superbatch = step.superbatch();
-            let stopping = stop.load(Ordering::Relaxed)
+            let save_on_stop = stop.load(Ordering::Relaxed)
                 && matches!(config.training.checkpoint.policy, CheckpointPolicy::Periodic { .. });
 
             if !nonfinite_loss.get()
                 && checkpoint_error.borrow().is_none()
-                && (should_save(&config, superbatch) || stopping)
+                && (should_save(&config, superbatch) || save_on_stop)
             {
                 reporter.phase("Saving checkpoint");
 
                 match checkpoints.save(trainer, &saved_format, superbatch) {
                     Ok(path) => {
                         reporter.notice(&format!("Checkpoint saved: {}", path.display()));
-                        *saved.borrow_mut() = Some(path);
+                        *latest_checkpoint.borrow_mut() = Some(path);
                     },
                     Err(error) => {
                         reporter.warning(
@@ -258,26 +260,7 @@ pub fn run_reported(
                 }
             }
         },
-        &mut |event| {
-            match event {
-                TrainingEvent::RunStarted { device_name, .. } => reporter.context("Device", device_name),
-                TrainingEvent::TrainingReady { .. } => reporter.phase("Training"),
-                TrainingEvent::SuperbatchCompleted { step, loss, .. } => {
-                    reporter.notice(&format!("Superbatch {} complete: mean loss {loss:.6}", step.superbatch()))
-                },
-                TrainingEvent::RunCompleted { .. } => reporter.phase("Finalizing training"),
-                _ => {},
-            }
-
-            let update = metrics.observe(event);
-            if let Some(progress) = update.progress {
-                reporter.progress(Progress::Training(progress));
-            }
-
-            if let Some(sample) = update.sample {
-                reporter.sample(sample);
-            }
-        },
+        &mut |event| report_training_event(event, &mut metrics, reporter),
     );
 
     if let Some(sample) = metrics.finish() {
@@ -292,7 +275,7 @@ pub fn run_reported(
         reporter.notice(&format!("Session mean loss: {loss:.6}"));
     }
 
-    if let Some(path) = &*saved.borrow() {
+    if let Some(path) = &*latest_checkpoint.borrow() {
         reporter.context("Latest checkpoint", path.to_string_lossy());
     }
 
@@ -304,11 +287,33 @@ pub fn run_reported(
         stop.load(Ordering::Relaxed),
     )?;
 
-    if outcome == Outcome::Cancelled && saved.borrow().is_none() {
+    if outcome == Outcome::Cancelled && latest_checkpoint.borrow().is_none() {
         reporter.warning("No checkpoint was saved; the next training invocation will start from the beginning.");
     }
 
     Ok(outcome)
+}
+
+fn report_training_event(event: &TrainingEvent, metrics: &mut TrainingMetrics, reporter: &Reporter)
+{
+    match event {
+        TrainingEvent::RunStarted { device_name, .. } => reporter.context("Device", device_name),
+        TrainingEvent::TrainingReady { .. } => reporter.phase("Training"),
+        TrainingEvent::SuperbatchCompleted { step, loss, .. } => {
+            reporter.notice(&format!("Superbatch {} complete: mean loss {loss:.6}", step.superbatch()))
+        },
+        TrainingEvent::RunCompleted { .. } => reporter.phase("Finalizing training"),
+        _ => {},
+    }
+
+    let update = metrics.observe(event);
+    if let Some(progress) = update.progress {
+        reporter.progress(Progress::Training(progress));
+    }
+
+    if let Some(sample) = update.sample {
+        reporter.sample(sample);
+    }
 }
 
 fn resolve_outcome(
@@ -319,6 +324,7 @@ fn resolve_outcome(
     stopping: bool,
 ) -> Result<Outcome>
 {
+    // A stop request may accompany a real failure; report failures before interpreting cancellation.
     if let Some(error) = checkpoint_error {
         return Err(error);
     }
@@ -352,9 +358,11 @@ fn ended_early(error: &TrainingError<ExecutionContext>) -> bool
 
 fn should_save(config: &Config, superbatch: usize) -> bool
 {
-    config.training.checkpoint.policy.should_save(superbatch)
-        || (matches!(config.training.checkpoint.policy, CheckpointPolicy::Periodic { .. })
-            && superbatch == config.training.superbatches)
+    let policy = config.training.checkpoint.policy;
+    let final_periodic_checkpoint =
+        matches!(policy, CheckpointPolicy::Periodic { .. }) && superbatch == config.training.superbatches;
+
+    policy.should_save(superbatch) || final_periodic_checkpoint
 }
 
 fn training_error(error: TrainingError<ExecutionContext>) -> anyhow::Error

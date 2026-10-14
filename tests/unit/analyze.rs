@@ -78,3 +78,20 @@ fn report_does_not_overwrite_existing_files()
     assert_eq!(decoded["limit_reached"], true);
     assert_eq!(decoded["score_distribution"]["0"], 1);
 }
+
+#[test]
+fn distribution_retains_signed_score_endpoints()
+{
+    let mut stats = Accumulator::new(None);
+    stats.observe(board(i16::MIN, 0));
+    stats.observe(board(i16::MAX, 2));
+
+    let report = stats.finish(None);
+
+    assert_eq!(report.score_distribution, BTreeMap::from([(i16::MIN, 1), (i16::MAX, 1)]));
+    assert_eq!(report.scores.minimum_cp, i16::MIN);
+    assert_eq!(report.scores.maximum_cp, i16::MAX);
+    assert_eq!(report.scores.mean_cp, -0.5);
+    assert_eq!(report.scores.percentiles_cp[&50], i16::MIN);
+    assert_eq!(report.scores.percentiles_cp[&99], i16::MAX);
+}

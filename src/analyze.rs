@@ -226,18 +226,22 @@ fn evaluate_batch<G: Gpu>(
     report: &mut Accumulator,
 ) -> Result<()>
 {
-    if let Some(evaluator) = evaluator
-        && !batch.is_empty()
-    {
-        let length = batch.len();
-        batch.resize(BATCH_SIZE, batch[0]);
-
-        for (board, value) in batch.iter().zip(evaluator.evaluate(batch)?).take(length) {
-            report.predict(*board, value)?;
-        }
-
-        batch.clear();
+    let Some(evaluator) = evaluator else {
+        return Ok(());
+    };
+    if batch.is_empty() {
+        return Ok(());
     }
+
+    let position_count = batch.len();
+    batch.resize(BATCH_SIZE, batch[0]);
+    let predictions = evaluator.evaluate(batch)?;
+
+    for (board, prediction) in batch.iter().zip(predictions).take(position_count) {
+        report.predict(*board, prediction)?;
+    }
+
+    batch.clear();
     Ok(())
 }
 
@@ -342,7 +346,8 @@ impl Accumulator
         self.mean += delta / self.count as f64;
         self.variance_sum += delta * (score - self.mean);
 
-        self.distribution[(i32::from(board.score) - i32::from(i16::MIN)) as usize] += 1;
+        let score_index = (i32::from(board.score) - i32::from(i16::MIN)) as usize;
+        self.distribution[score_index] += 1;
 
         self.results.observe(board.result);
 
@@ -394,21 +399,22 @@ impl Accumulator
         let minimum = distribution.first_key_value().map_or(0, |(&score, _)| score);
         let maximum = distribution.last_key_value().map_or(0, |(&score, _)| score);
 
-        let percentiles = [1, 5, 25, 50, 75, 95, 99]
-            .into_iter()
-            .map(|percentile| {
-                let target = (u128::from(self.count) * u128::from(percentile)).div_ceil(100) as u64;
-                let mut cumulative = 0;
-                let score = distribution
-                    .iter()
-                    .find_map(|(&score, &count)| {
-                        cumulative += count;
-                        (cumulative >= target).then_some(score)
-                    })
-                    .unwrap_or(0);
-                (percentile, score)
-            })
-            .collect();
+        let mut percentiles = BTreeMap::new();
+        for percentile in [1, 5, 25, 50, 75, 95, 99] {
+            let rank = (u128::from(self.count) * u128::from(percentile)).div_ceil(100) as u64;
+            let mut cumulative = 0;
+            let mut percentile_score = 0;
+
+            for (&score, &positions) in &distribution {
+                cumulative += positions;
+                if cumulative >= rank {
+                    percentile_score = score;
+                    break;
+                }
+            }
+
+            percentiles.insert(percentile, percentile_score);
+        }
 
         Report {
             perspective: "side_to_move",
@@ -452,17 +458,17 @@ impl ErrorSummary
         let count = self.positions as f64;
         let error = predicted - f64::from(board.score);
         let probability = sigmoid(predicted / f64::from(SCALE));
-        let teacher = sigmoid(f64::from(board.score) / f64::from(SCALE));
+        let teacher_probability = sigmoid(f64::from(board.score) / f64::from(SCALE));
+        let result_probability = f64::from(board.result) / 2.0;
 
         self.mean_prediction_cp += (predicted - self.mean_prediction_cp) / count;
         self.bias_cp += (error - self.bias_cp) / count;
         self.mean_absolute_error_cp += (error.abs() - self.mean_absolute_error_cp) / count;
         self.squared_error_sum += error * error;
         self.root_mean_squared_error_cp = (self.squared_error_sum / count).sqrt();
-        self.result_squared_error +=
-            ((probability - f64::from(board.result) / 2.0).powi(2) - self.result_squared_error) / count;
+        self.result_squared_error += ((probability - result_probability).powi(2) - self.result_squared_error) / count;
         self.teacher_probability_squared_error +=
-            ((probability - teacher).powi(2) - self.teacher_probability_squared_error) / count;
+            ((probability - teacher_probability).powi(2) - self.teacher_probability_squared_error) / count;
     }
 }
 
@@ -572,6 +578,7 @@ impl<G: Gpu> Evaluator<G>
                     .context("Cannot transfer network inputs")?;
             }
         }
+        
         self.function
             .execute(self.stream.clone(), &self.buffers)
             .and_then(|value| value.value())

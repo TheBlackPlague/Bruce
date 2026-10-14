@@ -48,8 +48,8 @@ struct State
     failure: Option<String>,
     failure_reported: bool,
     auxiliary_warning: Option<String>,
-    dropped_notice: u64,
-    dropped_log: u64,
+    dropped_samples_pending_diagnostics: u64,
+    dropped_samples_pending_log: u64,
 }
 
 enum Record
@@ -145,8 +145,8 @@ impl Logger
         }
 
         if state.queue.len() >= QUEUE_CAPACITY {
-            state.dropped_notice = state.dropped_notice.saturating_add(1);
-            state.dropped_log = state.dropped_log.saturating_add(1);
+            state.dropped_samples_pending_diagnostics = state.dropped_samples_pending_diagnostics.saturating_add(1);
+            state.dropped_samples_pending_log = state.dropped_samples_pending_log.saturating_add(1);
         } else {
             state.queue.push_back(Record::Sample(sample));
             shared.available.notify_one();
@@ -162,8 +162,8 @@ impl Logger
             messages.push(warning);
         }
 
-        if state.dropped_notice > 0 {
-            messages.push(dropped_message(std::mem::take(&mut state.dropped_notice)));
+        if state.dropped_samples_pending_diagnostics > 0 {
+            messages.push(dropped_message(std::mem::take(&mut state.dropped_samples_pending_diagnostics)));
         }
 
         if !state.failure_reported
@@ -203,6 +203,7 @@ impl Owner
                 self.shared.available.notify_one();
                 self.shared.space.notify_all();
             }
+            
             match worker.join() {
                 Ok(Ok(())) => {},
                 Ok(Err(error)) => self.shared.fail(error),
@@ -240,21 +241,25 @@ fn write_records(
     }
     writer.flush().context("Cannot flush the text log; check free space and permissions")?;
 
-    let mut flushed = Instant::now();
+    let mut last_flush = Instant::now();
 
     loop {
-        let (record, done) = {
+        let (record, drain_complete) = {
             let mut state = shared.state.lock().unwrap();
             if state.queue.is_empty() && !state.closed {
-                state =
-                    shared.available.wait_timeout(state, FLUSH_INTERVAL.saturating_sub(flushed.elapsed())).unwrap().0;
+                state = shared
+                    .available
+                    .wait_timeout(state, FLUSH_INTERVAL.saturating_sub(last_flush.elapsed()))
+                    .unwrap()
+                    .0;
             }
 
+            // Closing rejects producers but leaves queued lifecycle records available for draining.
             let record = state.queue.pop_front();
-            let done = state.closed && record.is_none();
+            let drain_complete = state.closed && record.is_none();
 
             shared.space.notify_all();
-            (record, done)
+            (record, drain_complete)
         };
 
         match record {
@@ -278,24 +283,24 @@ fn write_records(
             None => {},
         }
 
-        if done || flushed.elapsed() >= FLUSH_INTERVAL {
-            let dropped = std::mem::take(&mut shared.state.lock().unwrap().dropped_log);
+        if drain_complete || last_flush.elapsed() >= FLUSH_INTERVAL {
+            let dropped = std::mem::take(&mut shared.state.lock().unwrap().dropped_samples_pending_log);
             if dropped > 0 {
                 write_message(&mut writer, &format!("Warning: {}", dropped_message(dropped)))?;
             }
 
             tensorboard_action(shared, &mut writer, &mut tensorboard, TensorBoard::flush)?;
 
-            if done {
+            if drain_complete {
                 write_message(&mut writer, &format!("Session {session} closed"))?;
             }
 
             writer.flush().context("Cannot flush the text log; check free space and permissions")?;
 
-            flushed = Instant::now();
+            last_flush = Instant::now();
         }
 
-        if done {
+        if drain_complete {
             return Ok(());
         }
     }
@@ -433,9 +438,9 @@ impl TensorBoard
         let length = (data.len() as u64).to_le_bytes();
 
         self.writer.write_all(&length)?;
-        self.writer.write_all(&checksum(&length))?;
+        self.writer.write_all(&masked_crc32c(&length))?;
         self.writer.write_all(&data)?;
-        self.writer.write_all(&checksum(&data))?;
+        self.writer.write_all(&masked_crc32c(&data))?;
 
         Ok(())
     }
@@ -443,7 +448,11 @@ impl TensorBoard
     pub fn flush(&mut self) -> Result<()> { self.writer.flush().context("Cannot flush TensorBoard events") }
 }
 
-fn checksum(bytes: &[u8]) -> [u8; 4] { crc32c::crc32c(bytes).rotate_right(15).wrapping_add(0xa282_ead8).to_le_bytes() }
+fn masked_crc32c(bytes: &[u8]) -> [u8; 4]
+{
+    const MASK_OFFSET: u32 = 0xa282_ead8;
+    crc32c::crc32c(bytes).rotate_right(15).wrapping_add(MASK_OFFSET).to_le_bytes()
+}
 
 fn event(step: i64) -> Event
 {

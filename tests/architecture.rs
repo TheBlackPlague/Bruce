@@ -168,11 +168,12 @@ fn exported_networks_match_actual_mantaray()
         let bytes = weights.to_quantised_buffer(&architecture.saved_format(), true).unwrap();
         let network = temporary.path().join(format!("{architecture}.nnue"));
         std::fs::write(&network, &bytes).unwrap();
+
         let words: Vec<i16> = bytes[..architecture.payload_bytes()]
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|word| i16::from_le_bytes([word[0], word[1]]))
+            .map(|word| i16::from_le_bytes(*word))
             .collect();
 
         for fen in [
@@ -182,8 +183,10 @@ fn exported_networks_match_actual_mantaray()
             "7k/2p5/8/P7/3Q4/8/6K1/8 w - - 0 40",
         ] {
             let hidden = architecture.hidden();
+
             let mut ours = words[768 * hidden..769 * hidden].to_vec();
             let mut theirs = ours.clone();
+
             let position: ChessBoard = format!("{fen} | 0 | 0.5").parse().unwrap();
             Chess768.map_features(&position, |stm, ntm| {
                 for i in 0..hidden {
@@ -191,13 +194,20 @@ fn exported_networks_match_actual_mantaray()
                     theirs[i] = theirs[i].wrapping_add(words[ntm * hidden + i]);
                 }
             });
-            let sum =
-                ours.into_iter().chain(theirs).enumerate().fold(i32::from(words[771 * hidden]), |sum, (i, value)| {
-                    sum.wrapping_add(i32::from(value.clamp(0, 255)) * i32::from(words[769 * hidden + i]))
-                });
+
+            let output_weights = &words[769 * hidden..771 * hidden];
+
+            let mut sum = i32::from(words[771 * hidden]);
+            for (activation, weight) in ours.into_iter().chain(theirs).zip(output_weights) {
+                let clipped = i32::from(activation.clamp(0, 255));
+                sum = sum.wrapping_add(clipped * i32::from(*weight));
+            }
+
             let expected = sum.wrapping_mul(400) / 16_320;
+
             let actual = Command::new(&executable).arg(hidden.to_string()).arg(&network).arg(fen).output().unwrap();
             assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
+
             let actual: i32 = String::from_utf8(actual.stdout).unwrap().parse().unwrap();
             assert_eq!(actual, expected, "{architecture}: {fen}");
         }

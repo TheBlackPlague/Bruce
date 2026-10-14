@@ -149,6 +149,25 @@ impl OptimizerConfig
             beta2: self.beta2,
         }
     }
+
+    fn validate(&self) -> Result<()>
+    {
+        ensure!(self.decay.is_finite() && self.decay >= 0.0, "Weight decay must be finite and nonnegative");
+        ensure!(
+            (0.0..1.0).contains(&self.beta1) && (0.0..1.0).contains(&self.beta2),
+            "AdamW betas must be between 0 and 1"
+        );
+        ensure!(
+            self.minimum_weight.is_finite()
+                && self.maximum_weight.is_finite()
+                && self.minimum_weight < self.maximum_weight
+                && self.minimum_weight >= -2.0
+                && self.maximum_weight <= 2.0,
+            "Weight limits must be ordered within [-2, 2]"
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -403,20 +422,7 @@ impl Config
 
         self.data.validate()?;
 
-        let optimizer = &self.optimizer;
-        ensure!(optimizer.decay.is_finite() && optimizer.decay >= 0.0, "Weight decay must be finite and nonnegative");
-        ensure!(
-            (0.0..1.0).contains(&optimizer.beta1) && (0.0..1.0).contains(&optimizer.beta2),
-            "AdamW betas must be between 0 and 1"
-        );
-        ensure!(
-            optimizer.minimum_weight.is_finite()
-                && optimizer.maximum_weight.is_finite()
-                && optimizer.minimum_weight < optimizer.maximum_weight
-                && optimizer.minimum_weight >= -2.0
-                && optimizer.maximum_weight <= 2.0,
-            "Weight limits must be ordered within [-2, 2]"
-        );
+        self.optimizer.validate()?;
 
         Ok(())
     }

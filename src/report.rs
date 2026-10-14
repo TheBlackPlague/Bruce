@@ -45,8 +45,8 @@ pub struct TrainingMetrics
     log_every: usize,
     setup: Duration,
     latest: Option<TrainingProgress>,
-    loss_sum: f64,
-    loss_batches: usize,
+    window_loss_sum: f64,
+    window_batches: usize,
     run_loss_sum: f64,
     session_batches: usize,
 }
@@ -60,8 +60,8 @@ impl TrainingMetrics
             log_every: log_every.max(1),
             setup: Duration::ZERO,
             latest: None,
-            loss_sum: 0.0,
-            loss_batches: 0,
+            window_loss_sum: 0.0,
+            window_batches: 0,
             run_loss_sum: 0.0,
             session_batches: 0,
         }
@@ -101,8 +101,8 @@ impl TrainingMetrics
 
     fn batch_completed(&mut self, step: Step, loss: f32, learning_rate: f32, elapsed: Duration) -> Observation
     {
-        self.loss_sum += f64::from(loss);
-        self.loss_batches += 1;
+        self.window_loss_sum += f64::from(loss);
+        self.window_batches += 1;
         self.run_loss_sum += f64::from(loss);
         self.session_batches += 1;
 
@@ -114,8 +114,8 @@ impl TrainingMetrics
             batches_per_superbatch: step.batches_per_superbatch(),
             global_batch: step.total_batches() + 1,
             session_batches: self.session_batches,
-            loss: Some(self.loss_sum / self.loss_batches as f64),
-            loss_batches: self.loss_batches,
+            loss: Some(self.window_loss_sum / self.window_batches as f64),
+            loss_batches: self.window_batches,
             learning_rate,
             elapsed: elapsed.saturating_sub(self.setup),
             positions_per_second: None,
@@ -125,11 +125,9 @@ impl TrainingMetrics
         self.update_rates(&mut progress);
         self.latest = Some(progress);
 
-        let sample = if batch == 1 || batch == step.batches_per_superbatch() || batch.is_multiple_of(self.log_every) {
-            self.take_sample()
-        } else {
-            None
-        };
+        let superbatch_boundary = batch == 1 || batch == step.batches_per_superbatch();
+        let sample =
+            if superbatch_boundary || batch.is_multiple_of(self.log_every) { self.take_sample() } else { None };
 
         Observation { progress: Some(progress), sample }
     }
@@ -160,15 +158,15 @@ impl TrainingMetrics
 
     fn take_sample(&mut self) -> Option<MetricSample>
     {
-        if self.loss_batches == 0 {
+        if self.window_batches == 0 {
             return None;
         }
 
         let progress = self.latest?;
-        let loss = (self.loss_sum / self.loss_batches as f64) as f32;
+        let loss = (self.window_loss_sum / self.window_batches as f64) as f32;
 
-        self.loss_sum = 0.0;
-        self.loss_batches = 0;
+        self.window_loss_sum = 0.0;
+        self.window_batches = 0;
 
         Some(MetricSample {
             step: i64::try_from(progress.global_batch).ok()?,

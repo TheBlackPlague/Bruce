@@ -133,20 +133,16 @@ impl Policy
 {
     fn resolve(options: OutputOptions, capabilities: Capabilities) -> Self
     {
-        let live = options.display != DisplayMode::Plain
-            && capabilities.terminal
-            && !capabilities.dumb
-            && !capabilities.ci
-            && options.verbosity != Verbosity::Quiet;
-        let color = options.display != DisplayMode::Plain
-            && capabilities.terminal
-            && !capabilities.dumb
-            && !capabilities.ci
-            && match options.color {
-                ColorMode::Auto => !capabilities.no_color && !capabilities.ci,
-                ColorMode::Always => true,
-                ColorMode::Never => false,
-            };
+        let interactive =
+            options.display != DisplayMode::Plain && capabilities.terminal && !capabilities.dumb && !capabilities.ci;
+        let live = interactive && options.verbosity != Verbosity::Quiet;
+        let color_requested = match options.color {
+            ColorMode::Auto => !capabilities.no_color,
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+        };
+        let color = interactive && color_requested;
+
         Self { live, color, verbosity: options.verbosity }
     }
 }
@@ -250,8 +246,8 @@ impl Reporter
 
     pub fn start(&self, task: &str, run: &str)
     {
-        let task = clean(task);
-        let run = clean(run);
+        let task = clean_display_text(task);
+        let run = clean_display_text(run);
 
         let mut state = lock(&self.owner.shared.state);
 
@@ -274,8 +270,8 @@ impl Reporter
 
     pub fn context(&self, label: &str, value: impl AsRef<str>)
     {
-        let label = clean(label);
-        let value = clean(value.as_ref());
+        let label = clean_display_text(label);
+        let value = clean_display_text(value.as_ref());
         let message = format!("{label}: {value}");
 
         let mut state = lock(&self.owner.shared.state);
@@ -294,7 +290,7 @@ impl Reporter
 
     pub fn phase(&self, phase: &str)
     {
-        let mut phase = clean(phase);
+        let mut phase = clean_display_text(phase);
         let mut state = lock(&self.owner.shared.state);
 
         if state.stopping {
@@ -372,7 +368,7 @@ impl Reporter
 
     fn message(&self, message: &str, level: Level)
     {
-        let message = clean(message);
+        let message = clean_display_text(message);
         lock(&self.owner.shared.state).permanent(&message, level);
         self.record(&message);
     }
@@ -381,7 +377,7 @@ impl Reporter
     {
         let logger = lock(&self.owner.shared.logger).clone();
         if let Some(logger) = logger {
-            let _ = logger.record(&clean(message));
+            let _ = logger.record(&clean_display_text(message));
         }
     }
 
@@ -544,7 +540,7 @@ fn show_diagnostics(shared: &Shared, diagnostics: Vec<String>)
 {
     let mut state = lock(&shared.state);
     for diagnostic in diagnostics {
-        state.permanent(&format!("Warning: {}", clean(&diagnostic)), Level::Warning);
+        state.permanent(&format!("Warning: {}", clean_display_text(&diagnostic)), Level::Warning);
     }
 }
 
@@ -659,13 +655,16 @@ impl Renderer
 
     fn permanent(&self, message: &str, level: Level) -> io::Result<()>
     {
-        if self.policy.verbosity == Verbosity::Quiet && matches!(level, Level::Notice | Level::Verbose)
-            || self.policy.verbosity != Verbosity::Verbose && matches!(level, Level::Verbose)
-        {
+        let visible = match level {
+            Level::Notice => self.policy.verbosity != Verbosity::Quiet,
+            Level::Verbose => self.policy.verbosity == Verbosity::Verbose,
+            Level::Warning | Level::Error => true,
+        };
+        if !visible {
             return Ok(());
         }
 
-        let message = clean(message);
+        let message = clean_display_text(message);
         let text = if self.policy.live { wrap(&message, self.width()).join("\n") } else { message };
 
         let style = match level {
@@ -806,7 +805,7 @@ fn wrap(text: &str, width: usize) -> Vec<String>
     lines
 }
 
-fn clean(text: &str) -> String
+fn clean_display_text(text: &str) -> String
 {
     strip_ansi_codes(text)
         .chars()
@@ -911,7 +910,7 @@ mod tests
 
         assert_eq!(lines.concat(), path);
         assert!(lines.iter().all(|line| measure_text_width(line) <= 13));
-        assert_eq!(clean("\x1b[31mError\x1b[0m\r\nfile\x07"), "Error\nfile");
+        assert_eq!(clean_display_text("\x1b[31mError\x1b[0m\r\nfile\x07"), "Error\nfile");
     }
 
     #[test]
@@ -933,6 +932,31 @@ mod tests
     }
 
     fn captured(capture: &Mutex<Vec<u8>>) -> String { String::from_utf8(lock(capture).clone()).unwrap() }
+
+    #[test]
+    fn verbosity_filters_notices_and_details_but_preserves_errors()
+    {
+        for (verbosity, expected) in [
+            (Verbosity::Quiet, "warning\nerror\n"),
+            (Verbosity::Normal, "notice\nwarning\nerror\n"),
+            (Verbosity::Verbose, "notice\ndetails\nwarning\nerror\n"),
+        ] {
+            let capture = Arc::new(Mutex::new(Vec::new()));
+            let mut renderer = Renderer::new(Policy { live: false, color: false, verbosity });
+            renderer.capture = Some(capture.clone());
+
+            for (message, level) in [
+                ("notice", Level::Notice),
+                ("details", Level::Verbose),
+                ("warning", Level::Warning),
+                ("error", Level::Error),
+            ] {
+                renderer.permanent(message, level).unwrap();
+            }
+
+            assert_eq!(captured(&capture), expected);
+        }
+    }
 
     #[test]
     fn hidden_progress_does_not_hide_permanent_warnings()

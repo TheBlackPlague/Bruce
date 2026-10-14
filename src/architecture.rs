@@ -11,6 +11,7 @@ use bullet_trainer::model::{DenseInput, ModelDefinition, ModelInputs, ModelInput
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+// StockDory converts the network output to centipawns using this scale.
 pub const SCALE: f32 = 400.0;
 pub const QA: i16 = 255;
 pub const QB: i16 = 64;
@@ -45,7 +46,15 @@ impl Architecture
         }
     }
 
-    pub const fn payload_bytes(self) -> usize { (771 * self.hidden() + 1) * size_of::<i16>() }
+    pub const fn payload_bytes(self) -> usize
+    {
+        let feature_weights = 768 * self.hidden();
+        let feature_biases = self.hidden();
+        let output_weights = 2 * self.hidden();
+        let output_bias = 1;
+
+        (feature_weights + feature_biases + output_weights + output_bias) * size_of::<i16>()
+    }
 
     pub fn definition(self) -> ModelDefinition
     {
@@ -64,22 +73,24 @@ impl Architecture
     pub fn mapper(self, wdl: impl WdlScheduler) -> ModelInputsMapper<ChessBoard>
     {
         ModelInputsMapper::build(&inputs(), move |position: &ChessBoard, step, ((stm, ntm), targets)| {
-            let mut count = 0;
+            let mut active_features = 0;
+            
             Chess768.map_features(position, |ours, theirs| {
-                stm[count] = ours as i32;
-                ntm[count] = theirs as i32;
-                count += 1;
+                stm[active_features] = ours as i32;
+                ntm[active_features] = theirs as i32;
+                active_features += 1;
             });
 
-            if count < Chess768.max_active() {
-                stm[count] = -1;
-                ntm[count] = -1;
+            if active_features < Chess768.max_active() {
+                stm[active_features] = -1;
+                ntm[active_features] = -1;
             }
 
             let blend = wdl.blend(step.batch(), step.superbatch(), step.final_superbatch());
-            let score = 1.0 / (1.0 + (-f32::from(position.score) / SCALE).exp());
-            let result = f32::from(position.result) / 2.0;
-            targets[0] = blend * result + (1.0 - blend) * score;
+            let score_probability = 1.0 / (1.0 + (-f32::from(position.score) / SCALE).exp());
+            let result_probability = f32::from(position.result) / 2.0;
+
+            targets[0] = blend * result_probability + (1.0 - blend) * score_probability;
         })
     }
 

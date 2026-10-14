@@ -424,7 +424,7 @@ pub fn sf_board(entry: &sfbinpack::TrainingDataEntry) -> Result<ChessBoard>
 
 fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 {
-    use sfbinpack::chess::{piece::Piece, r#move::MoveType};
+    use sfbinpack::chess::{r#move::MoveType, piece::Piece};
 
     matches!(entry.mv.mtype(), MoveType::EnPassant | MoveType::Promotion)
         || (entry.mv.mtype() != MoveType::Castle && entry.pos.piece_at(entry.mv.to()) != Piece::none())
@@ -628,9 +628,9 @@ impl DatasetReader
     {
         let capacity = self.config.buffer_size_mb * 1024 * 1024 / size_of::<ChessBoard>();
 
-        let mut values = Vec::with_capacity(capacity);
+        let mut shuffle_buffer = Vec::with_capacity(capacity);
         let mut rng = StdRng::seed_from_u64(self.seed);
-        let mut remaining = skip;
+        let mut positions_to_skip = skip;
 
         loop {
             let mut stopped = false;
@@ -646,36 +646,7 @@ impl DatasetReader
                             let filter = self.config.filter.as_ref();
 
                             scope.spawn(move || {
-                                let mut batch = Vec::with_capacity(4096);
-                                let result = visit_validated(source, false, None, None, |record| {
-                                    if abort.load(Ordering::Relaxed) {
-                                        return Ok(true);
-                                    }
-
-                                    if !accepted(&record, filter)
-                                        || (source.format == Format::Sf && !valid_sf_score(record.board.score))
-                                    {
-                                        return Ok(false);
-                                    }
-
-                                    batch.push(record.board);
-
-                                    if batch.len() == 4096 {
-                                        let ready = std::mem::replace(&mut batch, Vec::with_capacity(4096));
-
-                                        if sender.send(Ok(ready)).is_err() {
-                                            return Ok(true);
-                                        }
-                                    }
-
-                                    Ok(false)
-                                });
-
-                                if let Err(error) = result {
-                                    let _ = sender.send(Err(error));
-                                } else if !batch.is_empty() {
-                                    let _ = sender.send(Ok(batch));
-                                }
+                                stream_source_batches(source, filter, abort, sender);
                             });
                             receiver
                         })
@@ -695,17 +666,17 @@ impl DatasetReader
 
                             let batch = batch.inspect_err(|_| abort.store(true, Ordering::Relaxed))?;
                             for board in batch {
-                                if remaining > 0 {
-                                    remaining -= 1;
+                                if positions_to_skip > 0 {
+                                    positions_to_skip -= 1;
                                     continue;
                                 }
 
-                                values.push(board);
-                                if values.len() == capacity {
-                                    values.shuffle(&mut rng);
+                                shuffle_buffer.push(board);
+                                if shuffle_buffer.len() == capacity {
+                                    shuffle_buffer.shuffle(&mut rng);
 
-                                    stopped = callback(&values);
-                                    values.clear();
+                                    stopped = callback(&shuffle_buffer);
+                                    shuffle_buffer.clear();
 
                                     if stopped {
                                         abort.store(true, Ordering::Relaxed);
@@ -728,15 +699,54 @@ impl DatasetReader
                     return;
                 }
             }
-            if !values.is_empty() {
-                values.shuffle(&mut rng);
+            if !shuffle_buffer.is_empty() {
+                shuffle_buffer.shuffle(&mut rng);
 
-                if callback(&values) {
+                if callback(&shuffle_buffer) {
                     return;
                 }
-                values.clear();
+                shuffle_buffer.clear();
             }
         }
+    }
+}
+
+fn stream_source_batches(
+    source: &DataSource,
+    filter: Option<&Filter>,
+    abort: &AtomicBool,
+    sender: std::sync::mpsc::SyncSender<Result<Vec<ChessBoard>>>,
+)
+{
+    const SOURCE_BATCH_SIZE: usize = 4096;
+
+    let mut batch = Vec::with_capacity(SOURCE_BATCH_SIZE);
+    let result = visit_validated(source, false, None, None, |record| {
+        if abort.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+
+        if !accepted(&record, filter) || (source.format == Format::Sf && !valid_sf_score(record.board.score)) {
+            return Ok(false);
+        }
+
+        batch.push(record.board);
+
+        if batch.len() == SOURCE_BATCH_SIZE {
+            let ready = std::mem::replace(&mut batch, Vec::with_capacity(SOURCE_BATCH_SIZE));
+
+            if sender.send(Ok(ready)).is_err() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    });
+
+    if let Err(error) = result {
+        let _ = sender.send(Err(error));
+    } else if !batch.is_empty() {
+        let _ = sender.send(Ok(batch));
     }
 }
 
@@ -872,23 +882,29 @@ fn read_bullet(paths: &[&str], skip: usize, mut callback: impl FnMut(&[ChessBoar
         .iter()
         .map(|path| Ok(std::fs::metadata(path)?.len() as usize / size_of::<ChessBoard>()))
         .collect::<Result<Vec<_>>>()?;
+    
     let positions: usize = sizes.iter().sum();
     ensure!(positions > 0, "The dataset is empty");
+    
     let mut offset = skip % positions;
     let mut first = 0;
     while offset >= sizes[first] {
         offset -= sizes[first];
         first += 1;
     }
+    
     let mut rotated = paths.to_vec();
     rotated.rotate_left(first);
+    
     if offset > 0 {
         if read_bullet_tail(rotated[0], offset, &mut callback)? {
             return Ok(());
         }
         rotated.rotate_left(1);
     }
+    
     DirectSequentialDataLoader::new(&rotated).read_chunks(0, callback);
+    
     Ok(())
 }
 

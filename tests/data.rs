@@ -271,7 +271,7 @@ fn sf_conversion_preserves_minimum_score_without_overflow()
 {
     use bullet_lib::game::formats::sfbinpack::{
         CompressedTrainingDataEntryWriter, TrainingDataEntry,
-        chess::{coords::Square, position::Position, r#move::Move},
+        chess::{coords::Square, r#move::Move, position::Position},
     };
 
     let directory = TempDir::new().unwrap();
@@ -359,6 +359,14 @@ fn mixed_reader_interleaves_sources_and_cancels_without_deadlock()
     assert_eq!(scores.len(), 10000);
     assert_eq!(scores.iter().filter(|&&score| score == 100).count(), 5000);
     assert_eq!(scores.iter().filter(|&&score| score == -100).count(), 5000);
+    assert_eq!(reader.error(), None);
+
+    let mut repeated_scores = Vec::new();
+    reader.read_chunks(0, |boards| {
+        repeated_scores.extend(boards.iter().map(|board| board.score));
+        repeated_scores.len() >= 10000
+    });
+    assert_eq!(repeated_scores, scores, "Worker timing must not change the seeded source order");
     assert_eq!(reader.error(), None);
 
     let mut first = None;

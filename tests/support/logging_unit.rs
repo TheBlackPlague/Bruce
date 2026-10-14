@@ -229,3 +229,18 @@ fn failed_tensorboard_flush_is_nonfatal_and_saved_in_text_log()
     assert!(text.contains("TensorBoard logging disabled"));
     assert!(text.contains("Required checkpoint saved"));
 }
+
+#[test]
+fn text_cleaning_preserves_plain_text_lines_and_tabs()
+{
+    assert_eq!(super::clean_text("plain λ\n\ttext"), "plain λ\n\ttext");
+    assert_eq!(super::clean_text("a\r\u{0}b\u{7}"), "ab");
+}
+
+#[test]
+fn text_cleaning_discards_incomplete_terminal_sequences()
+{
+    assert_eq!(super::clean_text("before\u{1b}[31"), "before");
+    assert_eq!(super::clean_text("before\u{1b}]8;;link"), "before");
+    assert_eq!(super::clean_text("before\u{1b}"), "before");
+}

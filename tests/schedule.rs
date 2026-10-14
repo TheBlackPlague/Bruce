@@ -123,3 +123,14 @@ fn rejects_numeric_schedule_overflow_and_underflow()
     let source = format!("{prefix}\n{lr}\n{CONSTANT_WDL}").replace("400", "2147483650");
     assert!(Config::from_toml(&source).is_err());
 }
+
+#[test]
+fn out_of_range_superbatches_use_endpoint_values()
+{
+    let config = configured(CONSTANT_LR, include_str!("fixtures/schedules/wdl-phases.toml"));
+
+    assert_eq!(config.learning_rate.lr(0, 0), config.learning_rate.lr(0, 1));
+    assert_eq!(config.learning_rate.lr(0, 401), config.learning_rate.lr(0, 400));
+    assert_eq!(config.wdl.blend(0, 0, 400), config.wdl.blend(0, 1, 400));
+    assert_eq!(config.wdl.blend(0, 401, 400), config.wdl.blend(0, 400, 400));
+}

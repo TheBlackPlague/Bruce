@@ -32,6 +32,36 @@ struct Value
 
 fn checksum(bytes: &[u8]) -> u32 { crc32c::crc32c(bytes).rotate_right(15).wrapping_add(0xa282_ead8) }
 
+fn decode_events(bytes: &[u8]) -> Vec<Event>
+{
+    const LENGTH_BYTES: usize = 8;
+    const CHECKSUM_BYTES: usize = 4;
+    const HEADER_BYTES: usize = LENGTH_BYTES + CHECKSUM_BYTES;
+
+    let mut cursor = 0;
+    let mut events = Vec::new();
+
+    while cursor < bytes.len() {
+        let length_end = cursor + LENGTH_BYTES;
+        let payload_start = cursor + HEADER_BYTES;
+        let length = &bytes[cursor..length_end];
+        let length_checksum = u32::from_le_bytes(bytes[length_end..payload_start].try_into().unwrap());
+        assert_eq!(checksum(length), length_checksum);
+
+        let payload_length = u64::from_le_bytes(length.try_into().unwrap()) as usize;
+        let payload_end = payload_start + payload_length;
+        let record_end = payload_end + CHECKSUM_BYTES;
+        let payload = &bytes[payload_start..payload_end];
+        let payload_checksum = u32::from_le_bytes(bytes[payload_end..record_end].try_into().unwrap());
+        assert_eq!(checksum(payload), payload_checksum);
+
+        events.push(Event::decode(payload).unwrap());
+        cursor = record_end;
+    }
+
+    events
+}
+
 #[test]
 fn tensorboard_sessions_preserve_steps_tags_and_valid_records()
 {
@@ -50,23 +80,7 @@ fn tensorboard_sessions_preserve_steps_tags_and_valid_records()
 
     for file in files {
         let bytes = fs::read(file.path()).unwrap();
-        let mut cursor = 0;
-        let mut events = Vec::new();
-
-        while cursor < bytes.len() {
-            let length = &bytes[cursor..cursor + 8];
-            assert_eq!(checksum(length), u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()));
-
-            let size = u64::from_le_bytes(length.try_into().unwrap()) as usize;
-            let data = &bytes[cursor + 12..cursor + 12 + size];
-            assert_eq!(
-                checksum(data),
-                u32::from_le_bytes(bytes[cursor + 12 + size..cursor + 16 + size].try_into().unwrap())
-            );
-
-            events.push(Event::decode(data).unwrap());
-            cursor += size + 16;
-        }
+        let events = decode_events(&bytes);
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].version.as_deref(), Some("brain.Event:2"));

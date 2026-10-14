@@ -156,54 +156,7 @@ fn main() -> ExitCode
 fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
 {
     match cli.command {
-        Command::Train(options) => {
-            reporter.phase("Reading configuration");
-            reporter.context("Config", options.config.to_string_lossy());
-            let loaded = Config::load(&options.config);
-            let mut config = match loaded {
-                Ok(config) => config,
-                Err(error) => {
-                    attach_log(reporter, None, None)?;
-                    return Err(error);
-                },
-            };
-
-            if let Some(path) = options.tensorboard_dir {
-                config.tensorboard.enabled = true;
-                config.tensorboard.path = path;
-            }
-
-            if let Some(interval) = options.log_every {
-                config.training.log_every = interval;
-            }
-
-            if let Err(error) = config.validate() {
-                attach_log(reporter, None, None)?;
-                return Err(error);
-            }
-
-            let log = PathBuf::from("logs").join(format!("{}.log", config.name));
-            let tensorboard = (config.tensorboard.enabled && !options.check)
-                .then_some((config.tensorboard.path.as_path(), config.name.as_str()));
-            attach_log(reporter, Some(log), tensorboard)?;
-
-            reporter.context("Run", &config.name);
-            reporter.verbose(&format!("Configuration: {config:#?}"));
-
-            if stop.load(Ordering::Relaxed) {
-                return Err(Cancelled.into());
-            }
-
-            if options.check {
-                let outcome = train::check_reported(&config, reporter, stop)?;
-                if outcome == Outcome::Success {
-                    result("Configuration and datasets checked")?;
-                }
-                Ok(outcome)
-            } else {
-                train::run_reported(config, options.resume, reporter, stop)
-            }
-        },
+        Command::Train(options) => run_training(options, reporter, stop),
 
         Command::Convert(options) => {
             attach_log(reporter, None, None)?;
@@ -211,10 +164,10 @@ fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
             reporter.context("Input", options.input.to_string_lossy());
             reporter.context("Output", options.output.to_string_lossy());
 
-            let summary = convert::run_reported(&options, reporter, stop)?;
-            reporter.verbose(&summary.to_string());
+            let summary = convert::run_reported(&options, reporter, stop)?.to_string();
+            reporter.verbose(&summary);
 
-            result(&summary.to_string())?;
+            write_result(&summary)?;
 
             Ok(Outcome::Success)
         },
@@ -244,10 +197,60 @@ fn run(cli: Cli, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
             let summary = report.summary();
             reporter.verbose(&summary);
 
-            result(&summary)?;
+            write_result(&summary)?;
 
             Ok(Outcome::Success)
         },
+    }
+}
+
+fn run_training(options: TrainOptions, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
+{
+    reporter.phase("Reading configuration");
+    reporter.context("Config", options.config.to_string_lossy());
+    
+    let mut config = match Config::load(&options.config) {
+        Ok(config) => config,
+        Err(error) => {
+            attach_log(reporter, None, None)?;
+            return Err(error);
+        },
+    };
+
+    if let Some(path) = options.tensorboard_dir {
+        config.tensorboard.enabled = true;
+        config.tensorboard.path = path;
+    }
+
+    if let Some(interval) = options.log_every {
+        config.training.log_every = interval;
+    }
+
+    if let Err(error) = config.validate() {
+        attach_log(reporter, None, None)?;
+        return Err(error);
+    }
+
+    let log = PathBuf::from("logs").join(format!("{}.log", config.name));
+    let tensorboard = (config.tensorboard.enabled && !options.check)
+        .then_some((config.tensorboard.path.as_path(), config.name.as_str()));
+    attach_log(reporter, Some(log), tensorboard)?;
+
+    reporter.context("Run", &config.name);
+    reporter.verbose(&format!("Configuration: {config:#?}"));
+
+    if stop.load(Ordering::Relaxed) {
+        return Err(Cancelled.into());
+    }
+
+    if options.check {
+        let outcome = train::check_reported(&config, reporter, stop)?;
+        if outcome == Outcome::Success {
+            write_result("Configuration and datasets checked")?;
+        }
+        Ok(outcome)
+    } else {
+        train::run_reported(config, options.resume, reporter, stop)
     }
 }
 
@@ -272,7 +275,7 @@ fn attach_log(reporter: &Reporter, path: Option<PathBuf>, tensorboard: Option<(&
     Ok(())
 }
 
-fn result(summary: &str) -> Result<()>
+fn write_result(summary: &str) -> Result<()>
 {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{summary}").context("Could not write the command result; check the receiving pipe")?;

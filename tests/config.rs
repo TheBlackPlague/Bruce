@@ -135,3 +135,17 @@ fn data_validation_rejects_overflowing_superbatch_size()
     data.batch_size = usize::MAX / bruce::schedule::BATCHES_PER_SUPERBATCH + 1;
     assert!(data.validate().is_err());
 }
+
+#[test]
+fn data_source_indexes_are_ordered_numerically()
+{
+    let mut source = EXAMPLE.to_owned();
+    for index in 1..=12 {
+        source.push_str(&format!("\n[training.data.source.{index}]\nformat='monty'\npath='data/part{index}.bin'\n"));
+    }
+
+    let config = Config::from_toml(&source).unwrap();
+    for index in 1..=12 {
+        assert_eq!(config.data.sources[index].path, PathBuf::from(format!("data/part{index}.bin")));
+    }
+}
