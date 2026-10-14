@@ -712,7 +712,7 @@ impl Renderer
         }
     }
 
-    fn width(&self) -> usize { usize::from(Term::stderr().size().1).saturating_sub(2).clamp(2, 92) }
+    fn width(&self) -> usize { usize::from(Term::stderr().size().1).saturating_sub(2).clamp(2, 120) }
 
     fn draw(&self, rows: &[String])
     {
@@ -1440,5 +1440,69 @@ mod tests
     {
         let path = "/data/two  spaces/棋譜/training.bullet";
         assert_eq!(wrap(path, 13).concat(), path);
+    }
+
+    #[test]
+    fn mascot_centers_identity_and_tall_wrapped_headers()
+    {
+        let (reporter, _) = captured_reporter(Verbosity::Quiet);
+        reporter.start("convert", "dataset");
+        reporter.context("Device", "CPU");
+        let mut state = lock(&reporter.owner.shared.state);
+
+        for color in [false, true] {
+            state.renderer.policy.color = color;
+            for width in [87, 92, 120] {
+                for rows in
+                    [layout::completed(&state, Outcome::Success, width, true), layout::active(&state, width, 60)]
+                {
+                    let title = rows.iter().position(|row| row.contains("Bruce ")).unwrap();
+                    assert_eq!(title, 7);
+                    assert!(rows.iter().all(|row| measure_text_width(row) <= width));
+                }
+            }
+        }
+
+        state.renderer.policy.color = false;
+        state.run = "x".repeat(500);
+        let rows = layout::completed(&state, Outcome::Success, 87, true);
+        let shark = rows.iter().position(|row| row.starts_with("                                        ██▄")).unwrap();
+        assert!(shark > 0);
+        let status = rows.iter().position(|row| row == "Conversion complete").unwrap();
+        assert_eq!(shark, (status - 1 - 17) / 2);
+    }
+
+    #[test]
+    fn work_context_takes_priority_over_mascot()
+    {
+        let (reporter, _) = captured_reporter(Verbosity::Quiet);
+        reporter.start("convert", "dataset");
+        reporter.phase("Converting positions");
+        reporter.context("Input", "/data/source.bullet");
+        let state = lock(&reporter.owner.shared.state);
+        let rows = layout::active(&state, 87, 24);
+        let text = rows.join("\n");
+        assert!(text.contains("/data/source.bullet"));
+        assert!(!text.contains(SHARK_TEST_MARKER));
+        assert!(text.contains("ctrl+c  cancel"));
+    }
+
+    #[test]
+    fn overflowing_live_frames_keep_the_cancellation_hint()
+    {
+        let (reporter, _) = captured_reporter(Verbosity::Quiet);
+        reporter.start("convert", "dataset");
+        reporter.phase(&"Long phase ".repeat(100));
+        reporter.progress(Progress::Work { completed: 32, total: Some(128), unit: "bytes" });
+        let state = lock(&reporter.owner.shared.state);
+
+        for (width, height) in [(38, 20), (18, 8)] {
+            let rows = layout::active(&state, width, height);
+            let text = rows.join("\n");
+            assert!(text.contains("ctrl+c  cancel"));
+            assert!(text.contains("32/128"));
+            assert!(rows.len() < height);
+            assert!(rows.iter().all(|row| measure_text_width(row) <= width));
+        }
     }
 }

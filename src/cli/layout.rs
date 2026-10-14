@@ -71,57 +71,44 @@ impl Layout
         let identity = if run.is_empty() { task.to_owned() } else { format!("{task} · {run}") };
         let device = state.contexts.iter().find(|(label, _)| label == "Device").map(|(_, value)| value.as_str());
 
-        if mascot {
-            let shark_width = mascot_width();
-            let column_start = shark_width + 4;
-            let beside = self.width >= column_start + 20;
-            let identity_width = if beside { self.width - column_start } else { self.width };
-            let mut identity_rows = vec![self.strong(title)];
-            if live {
-                identity_rows.push(truncate_str(&identity, identity_width, "…").into_owned());
-            } else {
-                identity_rows.extend(wrap(&identity, identity_width));
-            }
-            if let Some(device) = device {
-                if live {
-                    identity_rows.push(self.muted(truncate_str(device, identity_width, "…")));
-                } else {
-                    identity_rows.extend(wrap(device, identity_width).into_iter().map(|line| self.muted(line)));
-                }
-            }
+        if compact && !mascot {
+            self.text(&format!("{title} · {task}"));
+            return;
+        }
 
-            if !beside {
-                self.rows.extend(identity_rows);
+        let column_start = mascot_width() + 4;
+        let beside = mascot && self.width >= column_start + 20;
+        let identity_width = if beside { self.width - column_start } else { self.width };
+        let mut identity_rows: Vec<_> = wrap(&title, identity_width).into_iter().map(|row| self.strong(row)).collect();
+        let display_rows = |text: &str| {
+            if live { vec![truncate_str(text, identity_width, "…").into_owned()] } else { wrap(text, identity_width) }
+        };
+        identity_rows.extend(display_rows(&identity));
+        if let Some(device) = device {
+            identity_rows.extend(display_rows(device).into_iter().map(|row| self.muted(row)));
+        }
+
+        if beside {
+            let count = SHARK.len().max(identity_rows.len());
+            let shark_offset = (count - SHARK.len()) / 2;
+            let identity_offset = (count - identity_rows.len()) / 2;
+            for index in 0..count {
+                let shark = index.checked_sub(shark_offset).and_then(|index| SHARK.get(index)).copied().unwrap_or("");
+                let right = index.checked_sub(identity_offset).and_then(|index| identity_rows.get(index));
+                let row = if let Some(right) = right {
+                    let padding = " ".repeat(column_start.saturating_sub(measure_text_width(shark)));
+                    format!("{}{padding}{right}", self.accent(shark))
+                } else {
+                    self.accent(shark)
+                };
+                self.rows.push(row);
+            }
+        } else {
+            self.rows.extend(identity_rows);
+            if mascot {
                 self.blank();
                 for row in SHARK {
                     self.rows.push(self.accent(row));
-                }
-                return;
-            }
-
-            let count = SHARK.len().max(identity_rows.len());
-            for index in 0..count {
-                let shark = SHARK.get(index).copied().unwrap_or("");
-                let right = identity_rows.get(index).map(String::as_str).unwrap_or("");
-                let padding = " ".repeat(column_start.saturating_sub(measure_text_width(shark)));
-                self.rows.push(format!("{}{padding}{right}", self.accent(shark)));
-            }
-        } else if compact {
-            self.text(&format!("{title} · {task}"));
-        } else {
-            for row in wrap(&title, self.width) {
-                self.rows.push(self.strong(row));
-            }
-            if live {
-                self.text(&truncate_str(&identity, self.width, "…"));
-            } else {
-                self.text(&identity);
-            }
-            if let Some(device) = device {
-                if live {
-                    self.text(&truncate_str(device, self.width, "…"));
-                } else {
-                    self.text(device);
                 }
             }
         }
@@ -209,21 +196,41 @@ impl Layout
 pub(super) fn active(state: &State, width: usize, height: usize) -> Vec<String>
 {
     let budget = height.saturating_sub(1).max(1);
-    let mascot = width >= mascot_width() && height > SHARK.len();
-    let mut rows = active_rows(state, width, height, mascot);
-    if mascot && rows.len() > budget {
-        rows = active_rows(state, width, height, false);
+    let mut compact = height < 20;
+    let (mut rows, mut header_rows) = active_rows(state, width, height, compact);
+
+    if !compact && rows.len() > budget {
+        compact = true;
+        (rows, header_rows) = active_rows(state, width, height, compact);
     }
+
+    if !compact && width >= mascot_width() {
+        let mut header = Layout::new(width, state.renderer.policy.color);
+        header.header(state, true, false, true);
+        if header.rows.len() + rows.len() - header_rows <= budget {
+            rows.splice(..header_rows, header.rows);
+        }
+    }
+
+    if rows.len() > budget && !state.stopping {
+        let hint_rows = wrap(cancellation_hint(state), width).len();
+        if hint_rows < budget {
+            let hint = rows.split_off(rows.len() - hint_rows);
+            rows.truncate(budget - hint_rows);
+            rows.extend(hint);
+        }
+    }
+
     rows.truncate(budget);
     rows
 }
 
-fn active_rows(state: &State, width: usize, height: usize, mascot: bool) -> Vec<String>
+fn active_rows(state: &State, width: usize, height: usize, compact: bool) -> (Vec<String>, usize)
 {
     let budget = height.saturating_sub(1).max(1);
-    let compact = height < 20;
     let mut layout = Layout::new(width, state.renderer.policy.color);
-    layout.header(state, mascot, compact, true);
+    layout.header(state, false, compact, true);
+    let header_rows = layout.rows.len();
 
     if !compact {
         layout.blank();
@@ -321,13 +328,17 @@ fn active_rows(state: &State, width: usize, height: usize, mascot: bool) -> Vec<
         if !compact {
             layout.blank();
         }
-        let hint = if state.task.eq_ignore_ascii_case("train") { "ctrl+c  stop safely" } else { "ctrl+c  cancel" };
-        for row in wrap(hint, width) {
+        for row in wrap(cancellation_hint(state), width) {
             layout.rows.push(layout.muted(row));
         }
     }
 
-    layout.rows
+    (layout.rows, header_rows)
+}
+
+fn cancellation_hint(state: &State) -> &'static str
+{
+    if state.task.eq_ignore_ascii_case("train") { "ctrl+c  stop safely" } else { "ctrl+c  cancel" }
 }
 
 pub(super) fn completed(state: &State, outcome: Outcome, width: usize, rich_output: bool) -> Vec<String>
