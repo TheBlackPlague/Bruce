@@ -42,6 +42,7 @@ pub fn run(options: &Options) -> Result<Report>
 
     let outcome = match &result {
         Ok(_) => cli::Outcome::Success,
+        Err(error) if error.is::<cli::Cancelled>() => cli::Outcome::Cancelled,
         Err(error) => {
             reporter.error(
                 "Dataset analysis failed",
@@ -61,6 +62,7 @@ pub fn run(options: &Options) -> Result<Report>
 
 pub fn run_reported(options: &Options, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Report>
 {
+    reporter.set_stop_flag(stop.clone());
     reporter.phase("Preparing analysis");
     check_cancelled(&stop)?;
 

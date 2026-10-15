@@ -71,7 +71,9 @@ pub fn run(options: &Options, plain: bool) -> Result<Summary>
     reporter.context("Output", options.output.to_string_lossy());
 
     let result = run_reported(options, &reporter, Arc::new(AtomicBool::new(false)));
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && !error.is::<cli::Cancelled>()
+    {
         reporter.error(
             "Dataset conversion failed",
             "Check the input format and destination permissions",
@@ -79,7 +81,11 @@ pub fn run(options: &Options, plain: bool) -> Result<Summary>
         );
     }
 
-    let outcome = if result.is_ok() { cli::Outcome::Success } else { cli::Outcome::Failed };
+    let outcome = match &result {
+        Ok(_) => cli::Outcome::Success,
+        Err(error) if error.is::<cli::Cancelled>() => cli::Outcome::Cancelled,
+        Err(_) => cli::Outcome::Failed,
+    };
     let finished = reporter.finish(outcome);
 
     let summary = result?;
@@ -90,6 +96,8 @@ pub fn run(options: &Options, plain: bool) -> Result<Summary>
 
 pub fn run_reported(options: &Options, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Summary>
 {
+    reporter.set_stop_flag(stop.clone());
+
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| convert(options, reporter, &stop))).map_err(|panic| {
         let message = panic
             .downcast_ref::<String>()

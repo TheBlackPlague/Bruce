@@ -39,6 +39,8 @@ pub fn check(config: &Config) -> Result<()>
 
 pub fn check_reported(config: &Config, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
 {
+    reporter.set_stop_flag(stop.clone());
+
     config.validate()?;
     
     let mut positions = 0u64;
@@ -139,6 +141,8 @@ pub fn run_reported(
     stop: Arc<AtomicBool>,
 ) -> Result<Outcome>
 {
+    reporter.set_stop_flag(stop.clone());
+
     config.validate()?;
     
     if !cfg!(any(feature = "cuda", feature = "rocm", feature = "metal")) {

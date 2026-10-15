@@ -23,6 +23,8 @@ console = "0.16"
 crc32c = "0.6"
 ctrlc = "3.4"
 indicatif = "0.18"
+crossterm = "0.29"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "scrolling-regions"] }
 prost = "0.14"
 rand = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }

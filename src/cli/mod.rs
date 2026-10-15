@@ -11,13 +11,13 @@ use std::{
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
 use console::{Style, Term};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::logging::{Logger, Sample};
 pub use crate::report::TrainingProgress;
 
 mod output;
 mod render;
+mod terminal;
 pub use output::{CommandOutput, OutputSection};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -117,13 +117,15 @@ struct Shared
 struct State
 {
     view: View,
-    terminal: Terminal,
+    output: Output,
+    messages: Vec<(String, Level)>,
     logger: Option<Logger>,
     stop: Option<Arc<AtomicBool>>,
     plain_at: Instant,
     write_error: Option<String>,
 }
 
+#[derive(Clone)]
 struct View
 {
     task: String,
@@ -151,20 +153,18 @@ enum Level
     Error,
 }
 
-struct Terminal
+struct Output
 {
     live: bool,
     color: bool,
     verbosity: Verbosity,
-    lines: ProgressBar,
-    progress: MultiProgress,
 }
 
 impl Reporter
 {
     pub fn new(options: OutputOptions) -> Self
     {
-        let terminal = Terminal::new(options);
+        let output = Output::new(options);
 
         let now = Instant::now();
         let shared = Arc::new(Shared {
@@ -183,9 +183,10 @@ impl Reporter
                     failure: None,
                     contexts: Vec::new(),
                     stopping: false,
-                    color: terminal.color,
+                    color: output.color,
                 },
-                terminal,
+                output,
+                messages: Vec::new(),
                 logger: None,
                 stop: None,
                 plain_at: now,
@@ -203,8 +204,7 @@ impl Reporter
 
         if !available {
             let mut state = reporter.state();
-            state.terminal.live = false;
-            state.terminal.progress.set_draw_target(ProgressDrawTarget::hidden());
+            state.output.live = false;
             drop(state);
 
             reporter.warning("Live updates are unavailable; progress will be printed when work reports an update.");
@@ -264,7 +264,7 @@ impl Reporter
         state.view.run = run;
         state.view.started = Instant::now();
 
-        if !state.terminal.live {
+        if !state.output.live {
             state.write(&title, Level::Notice);
         }
 
@@ -286,7 +286,7 @@ impl Reporter
             state.view.contexts.push((label, value));
         }
 
-        if !state.terminal.live {
+        if !state.output.live {
             state.write(&message, Level::Notice);
         }
 
@@ -312,7 +312,7 @@ impl Reporter
         state.view.progress = None;
         state.plain_at = Instant::now();
 
-        if !state.terminal.live {
+        if !state.output.live {
             state.write(&format!("Phase: {phase}"), Level::Notice);
         }
 
@@ -373,7 +373,7 @@ impl Reporter
         let mut state = self.state();
         state.view.failure = Some((summary, recovery));
 
-        if !state.terminal.live {
+        if !state.output.live {
             state.write(&message, Level::Error);
         }
 
@@ -418,8 +418,6 @@ impl Reporter
             failure = Some("The display worker stopped unexpectedly".to_owned());
         }
 
-        self.state().terminal.lines.finish_and_clear();
-
         if let Some(logger) = self.logger() {
             let state = self.state();
             let snapshot = render::plain(&state.view, true).join("\n");
@@ -448,7 +446,9 @@ impl Reporter
             failure.get_or_insert(error);
         }
 
-        let rich = state.terminal.live && io::stdout().is_terminal();
+        state.flush_messages();
+
+        let rich = state.output.live && io::stdout().is_terminal();
 
         if requested == Outcome::Success
             && failure.is_none()
@@ -464,14 +464,14 @@ impl Reporter
         if let Some(message) = &failure {
             let recovery = "Check the output destination and available disk space before retrying.";
             state.view.failure = Some((message.clone(), recovery.into()));
-            if !state.terminal.live {
+            if !state.output.live {
                 state.write(&format!("Error: {message}\nHelp: {recovery}"), Level::Error);
             }
         }
 
         let outcome = if failure.is_some() { Outcome::Failed } else { requested };
 
-        if state.terminal.live {
+        if state.output.live {
             let rows = render::completed(&state.view, outcome, width(), rich);
             let mut stderr = io::stderr().lock();
             if let Err(error) = writeln!(stderr, "{}", rows.join("\n")).and_then(|()| stderr.flush()) {
@@ -502,7 +502,7 @@ impl Drop for Session
             let _ = worker.join();
         }
 
-        lock(&self.shared.state).terminal.lines.finish_and_clear();
+        lock(&self.shared.state).flush_messages();
     }
 }
 
@@ -510,9 +510,26 @@ impl Shared
 {
     fn run(&self)
     {
-        while !self.closed.load(Ordering::Acquire) {
-            let logger = lock(&self.state).logger.clone();
+        let live = lock(&self.state).output.live;
+        let mut terminal = if live {
+            match terminal::Terminal::new() {
+                Ok(terminal) => Some(terminal),
+                Err(error) => {
+                    let mut state = lock(&self.state);
+                    state.output.live = false;
+                    state.flush_messages();
+                    state.write(&format!("Warning: Live display unavailable: {error}"), Level::Warning);
+                    None
+                },
+            }
+        } else {
+            None
+        };
 
+        while !self.closed.load(Ordering::Acquire) {
+            let frame_started = Instant::now();
+
+            let logger = lock(&self.state).logger.clone();
             let diagnostics = logger.map(|logger| logger.take_diagnostics()).unwrap_or_default();
 
             let mut state = lock(&self.state);
@@ -522,14 +539,87 @@ impl Shared
                 state.acknowledge_stop();
             }
 
+            let view = state.view.clone();
+            let messages = std::mem::take(&mut state.messages);
+            
             state.redraw();
+            drop(state);
 
-            if self.closed.load(Ordering::Acquire) {
-                break;
+            if let Some(display) = terminal.as_mut() {
+                let result = self.display(display, &view, messages);
+                if let Err(error) = result {
+                    let cleanup = display.close();
+                    terminal = None;
+
+                    let mut state = lock(&self.state);
+                    state.output.live = false;
+                    state.write_error.get_or_insert_with(|| format!("Cannot update the live display: {error}"));
+
+                    if let Err(error) = cleanup {
+                        state.write(&format!("Warning: Cannot restore the terminal: {error}"), Level::Warning);
+                    }
+
+                    state.write("Warning: Live display stopped; continuing with plain output.", Level::Warning);
+                }
             }
 
-            let _ = self.wake.wait_timeout(state, Duration::from_millis(100));
+            let mut state = lock(&self.state);
+            while !self.closed.load(Ordering::Acquire) {
+                let remaining = Duration::from_millis(100).saturating_sub(frame_started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+
+                state = match self.wake.wait_timeout(state, remaining) {
+                    Ok((state, _)) => state,
+                    Err(error) => error.into_inner().0,
+                };
+            }
         }
+
+        if let Some(mut terminal) = terminal {
+            let mut state = lock(&self.state);
+            let messages = std::mem::take(&mut state.messages);
+            let color = state.output.color;
+            drop(state);
+
+            for (text, level) in messages {
+                if let Err(error) = terminal.write(&text, level, color) {
+                    lock(&self.state).write_error.get_or_insert_with(|| format!("Cannot write status: {error}"));
+                }
+            }
+
+            if let Err(error) = terminal.close() {
+                lock(&self.state).write_error.get_or_insert_with(|| format!("Cannot restore the terminal: {error}"));
+            }
+        }
+    }
+
+    fn display(&self, terminal: &mut terminal::Terminal, view: &View, messages: Vec<(String, Level)>)
+    -> io::Result<()>
+    {
+        for (text, level) in messages {
+            terminal.write(&text, level, view.color)?;
+        }
+
+        if lock(&self.state).stop.is_some() {
+            terminal.enable_keyboard()?;
+        }
+
+        if terminal.poll_stop()? {
+            let mut state = lock(&self.state);
+            
+            if let Some(stop) = &state.stop {
+                stop.store(true, Ordering::Release);
+                state.acknowledge_stop();
+            }
+        }
+
+        if !view.phase.is_empty() {
+            terminal.draw(view)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -537,8 +627,23 @@ impl State
 {
     fn write(&mut self, text: &str, level: Level)
     {
-        if let Err(error) = self.terminal.write(text, level) {
+        if !self.output.visible(level) {
+            return;
+        }
+
+        if self.output.live {
+            self.messages.push((text.to_owned(), level));
+        } else if let Err(error) = self.output.write(text, level) {
             self.write_error.get_or_insert_with(|| format!("Cannot write status to stderr: {error}"));
+        }
+    }
+
+    fn flush_messages(&mut self)
+    {
+        for (text, level) in std::mem::take(&mut self.messages) {
+            if let Err(error) = self.output.write(&text, level) {
+                self.write_error.get_or_insert_with(|| format!("Cannot write status to stderr: {error}"));
+            }
         }
     }
 
@@ -559,7 +664,7 @@ impl State
         self.view.phase = "Stopping at the next safe boundary".into();
         self.view.phase_started = Instant::now();
 
-        if !self.terminal.live {
+        if !self.output.live {
             self.write(
                 "Stopping: stop requested; waiting for the current operation and safe checkpoint boundary.",
                 Level::Warning,
@@ -569,16 +674,11 @@ impl State
 
     fn redraw(&mut self)
     {
-        if self.terminal.verbosity == Verbosity::Quiet || self.view.phase.is_empty() {
+        if self.output.verbosity == Verbosity::Quiet || self.view.phase.is_empty() {
             return;
         }
 
-        if self.terminal.live {
-            let rows = render::active(&self.view, width(), usize::from(Term::stderr().size().0));
-
-            self.terminal.lines.set_message(rows.join("\n"));
-            self.terminal.lines.tick();
-        } else if self.plain_at.elapsed() >= Duration::from_secs(5) {
+        if !self.output.live && self.plain_at.elapsed() >= Duration::from_secs(5) {
             for row in render::plain(&self.view, false) {
                 self.write(&row, Level::Notice);
             }
@@ -614,12 +714,13 @@ impl State
     }
 }
 
-impl Terminal
+impl Output
 {
     fn new(options: OutputOptions) -> Self
     {
         let interactive = options.display != DisplayMode::Plain
             && io::stderr().is_terminal()
+            && io::stdout().is_terminal()
             && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
             && std::env::var_os("CI").is_none();
 
@@ -632,29 +733,23 @@ impl Terminal
                 ColorMode::Auto => !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
             };
 
-        let target = if live { ProgressDrawTarget::stderr_with_hz(10) } else { ProgressDrawTarget::hidden() };
-        let progress = MultiProgress::with_draw_target(target);
+        Self { live, color, verbosity: options.verbosity }
+    }
 
-        let lines = progress.add(ProgressBar::new_spinner());
-        lines.set_style(ProgressStyle::with_template("{msg}").expect("valid progress template"));
-
-        Self { live, color, verbosity: options.verbosity, lines, progress }
+    fn visible(&self, level: Level) -> bool
+    {
+        match level {
+            Level::Notice => self.verbosity != Verbosity::Quiet,
+            Level::Detail => self.verbosity == Verbosity::Verbose,
+            Level::Warning | Level::Error => true,
+        }
     }
 
     fn write(&self, text: &str, level: Level) -> io::Result<()>
     {
-        let visible = match level {
-            Level::Notice => self.verbosity != Verbosity::Quiet,
-            Level::Detail => self.verbosity == Verbosity::Verbose,
-            Level::Warning | Level::Error => true,
-        };
-        if !visible {
+        if !self.visible(level) {
             return Ok(());
         }
-
-        let text = clean(text);
-
-        let text = if self.live { render::wrap(&text, width()).join("\n") } else { text };
 
         let style = match level {
             Level::Warning => Style::new().yellow().bold(),
@@ -662,13 +757,8 @@ impl Terminal
             _ => Style::new(),
         };
 
-        let text = style.for_stderr().force_styling(self.color).apply_to(text).to_string();
-
-        if self.live && !self.progress.is_hidden() {
-            self.progress.println(text)
-        } else {
-            writeln!(io::stderr().lock(), "{text}")
-        }
+        let text = style.for_stderr().force_styling(self.color).apply_to(clean(text)).to_string();
+        writeln!(io::stderr().lock(), "{text}")
     }
 }
 

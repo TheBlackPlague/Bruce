@@ -1,6 +1,10 @@
 use std::time::Duration;
 
-use console::{Style, measure_text_width, truncate_str};
+use console::{Style as ConsoleStyle, measure_text_width, truncate_str};
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
 
 use super::{Outcome, Progress, TrainingProgress, View, clean};
 
@@ -28,31 +32,31 @@ struct Frame
 {
     width: usize,
     color: bool,
-    rows: Vec<String>,
+    rows: Vec<Line<'static>>,
 }
 
 impl Frame
 {
     fn new(width: usize, color: bool) -> Self { Self { width: width.max(2), color, rows: Vec::new() } }
 
-    fn style(&self, text: impl AsRef<str>, style: Style) -> String
+    fn style(&self, text: impl AsRef<str>, style: Style) -> Span<'static>
     {
-        style.for_stderr().force_styling(self.color).apply_to(text.as_ref()).to_string()
+        Span::styled(text.as_ref().to_owned(), if self.color { style } else { Style::default() })
     }
 
-    fn text(&mut self, text: &str) { self.rows.extend(wrap(&clean(text), self.width)); }
+    fn text(&mut self, text: &str) { self.rows.extend(wrap(&clean(text), self.width).into_iter().map(Line::from)); }
 
     fn styled(&mut self, text: &str, style: Style)
     {
         for row in wrap(&clean(text), self.width) {
-            self.rows.push(self.style(row, style.clone()));
+            self.rows.push(Line::from(self.style(row, style)));
         }
     }
 
     fn gap(&mut self)
     {
-        if self.rows.last().is_some_and(|row| !row.is_empty()) {
-            self.rows.push(String::new());
+        if self.rows.last().is_some_and(|row| row.width() > 0) {
+            self.rows.push(Line::default());
         }
     }
 
@@ -66,12 +70,11 @@ impl Frame
         if space < 2 {
             self.text(&format!("{label}  {value}"));
         } else {
-            self.rows.push(format!(
-                "{}{}{}",
-                self.style(label, Style::new().dim()),
-                " ".repeat(space),
-                self.style(value, Style::new().bold())
-            ));
+            self.rows.push(Line::from(vec![
+                self.style(label, Style::default().dim()),
+                Span::raw(" ".repeat(space)),
+                self.style(value, Style::default().bold()),
+            ]));
         }
     }
 
@@ -97,11 +100,16 @@ impl Frame
             
             let height = columns.iter().map(Vec::len).max().unwrap_or(0);
             for row in 0..height {
-                let left = columns[0].get(row).map(String::as_str).unwrap_or("");
-                let right = columns.get(1).and_then(|column| column.get(row)).map(String::as_str).unwrap_or("");
-                
-                self.rows
-                    .push(format!("{left}{}{right}", " ".repeat(width.saturating_sub(measure_text_width(left)) + 4)));
+                let left = columns[0].get(row).cloned().unwrap_or_default();
+                let right = columns.get(1).and_then(|column| column.get(row)).cloned().unwrap_or_default();
+
+                let padding = width.saturating_sub(left.width()) + 4;
+
+                let mut spans = left.spans;
+                spans.push(Span::raw(" ".repeat(padding)));
+                spans.extend(right.spans);
+
+                self.rows.push(Line::from(spans));
             }
         }
     }
@@ -121,12 +129,12 @@ impl Frame
         let length = self.width.saturating_sub(percent.len() + 2);
         let filled = (fraction * length as f64).round() as usize;
         
-        self.rows.push(format!(
-            "{}{}  {}",
-            self.style("━".repeat(filled), Style::new().cyan()),
-            self.style("─".repeat(length - filled), Style::new().dim()),
-            self.style(percent, Style::new().dim())
-        ));
+        self.rows.push(Line::from(vec![
+            self.style("━".repeat(filled), Style::default().cyan()),
+            self.style("─".repeat(length - filled), Style::default().dim()),
+            Span::raw("  "),
+            self.style(percent, Style::default().dim()),
+        ]));
     }
 
     fn context(&mut self, label: &str, value: &str)
@@ -142,8 +150,13 @@ impl Frame
         }
         
         for (index, row) in wrap(&value, self.width - indent).into_iter().enumerate() {
-            let prefix = if index == 0 { self.style(&prefix, Style::new().dim()) } else { " ".repeat(indent) };
-            self.rows.push(format!("{prefix}{row}"));
+            let prefix = if index == 0 {
+                self.style(&prefix, Style::default().dim())
+            } else {
+                Span::raw(" ".repeat(indent))
+            };
+
+            self.rows.push(Line::from(vec![prefix, Span::raw(row)]));
         }
     }
 
@@ -164,15 +177,23 @@ impl Frame
         let beside = mascot && self.width >= column + 20;
         let width = if beside { self.width - column } else { self.width };
         let identity_rows = |text: &str| {
-            if active { vec![truncate_str(text, width, "…").into_owned()] } else { wrap(text, width) }
+            let text = clean(text);
+
+            if active { vec![truncate_str(&text, width, "…").into_owned()] } else { wrap(&text, width) }
         };
         
-        let mut rows: Vec<String> =
-            wrap(&title, width).into_iter().map(|row| self.style(row, Style::new().bold())).collect();
-        rows.extend(identity_rows(&identity));
+        let mut rows: Vec<Line<'static>> =
+            wrap(&title, width).into_iter().map(|row| Line::from(self.style(row, Style::default().bold()))).collect();
+        rows.extend(identity_rows(&identity).into_iter().map(Line::from));
         
         if let Some(device) = context(view, "Device") {
-            rows.extend(identity_rows(device).into_iter().map(|row| self.style(row, Style::new().dim())));
+            rows.extend(
+                identity_rows(device).into_iter().map(|row| Line::from(self.style(row, Style::default().dim()))),
+            );
+        }
+        
+        if mascot {
+            self.rows.push(Line::default());
         }
         
         if beside {
@@ -184,13 +205,13 @@ impl Frame
             for row in 0..height {
                 let art = row.checked_sub(art_start).and_then(|i| SHARK.get(i)).copied().unwrap_or("");
                 
-                let mut line = self.style(art, Style::new().cyan());
+                let mut spans = vec![self.style(art, Style::default().cyan())];
                 if let Some(text) = row.checked_sub(text_start).and_then(|i| rows.get(i)) {
-                    line.push_str(&" ".repeat(column.saturating_sub(measure_text_width(art))));
-                    line.push_str(text);
+                    spans.push(Span::raw(" ".repeat(column.saturating_sub(measure_text_width(art)))));
+                    spans.extend(text.spans.iter().cloned());
                 }
-                
-                self.rows.push(line);
+
+                self.rows.push(Line::from(spans));
             }
         } else {
             self.rows.extend(rows);
@@ -199,22 +220,25 @@ impl Frame
                 self.gap();
                 
                 for row in SHARK {
-                    self.rows.push(self.style(row, Style::new().cyan()));
+                    self.rows.push(Line::from(self.style(row, Style::default().cyan())));
                 }
             }
         }
     }
 }
 
-pub(super) fn active(view: &View, width: usize, height: usize) -> Vec<String>
+pub(super) fn live(view: &View, width: u16, height: u16, keyboard: bool) -> Vec<Line<'static>>
 {
+    let width = usize::from(width).saturating_sub(2).clamp(2, 120);
+    let height = usize::from(height);
+
     let budget = height.saturating_sub(1).max(1);
     let mut compact = height < 20;
     
-    let (mut frame, mut header) = running_frame(view, width, budget, compact);
+    let (mut frame, mut header) = running_frame(view, width, budget, compact, keyboard);
     if !compact && frame.rows.len() > budget {
         compact = true;
-        (frame, header) = running_frame(view, width, budget, true);
+        (frame, header) = running_frame(view, width, budget, true, keyboard);
     }
     
     if !compact && width >= mascot_width() {
@@ -227,7 +251,7 @@ pub(super) fn active(view: &View, width: usize, height: usize) -> Vec<String>
     }
     
     if frame.rows.len() > budget && !view.stopping {
-        let hint_count = wrap(hint(view), width).len();
+        let hint_count = wrap(hint(view, keyboard), width).len();
         
         if hint_count < budget {
             let hint = frame.rows.split_off(frame.rows.len() - hint_count);
@@ -241,7 +265,7 @@ pub(super) fn active(view: &View, width: usize, height: usize) -> Vec<String>
     frame.rows
 }
 
-fn running_frame(view: &View, width: usize, budget: usize, compact: bool) -> (Frame, usize)
+fn running_frame(view: &View, width: usize, budget: usize, compact: bool, keyboard: bool) -> (Frame, usize)
 {
     let mut frame = Frame::new(width, view.color);
     frame.header(view, false, compact, true);
@@ -257,7 +281,7 @@ fn running_frame(view: &View, width: usize, budget: usize, compact: bool) -> (Fr
     let tick = (view.started.elapsed().as_millis() / 100) as usize % spinner.len();
     let status = format!("{} {phase}", spinner[tick]);
     let status = if compact { truncate_str(&status, width.max(2), "…").into_owned() } else { status };
-    frame.styled(&status, Style::new().cyan());
+    frame.styled(&status, Style::default().cyan());
     
     let training = match &view.progress {
         Some(Progress::Training(value)) => Some(value),
@@ -340,7 +364,7 @@ fn running_frame(view: &View, width: usize, budget: usize, compact: bool) -> (Fr
             frame.gap();
         }
         
-        frame.styled(hint(view), Style::new().dim());
+        frame.styled(hint(view, keyboard), Style::default().dim());
     }
     
     (frame, header)
@@ -353,9 +377,9 @@ pub(super) fn completed(view: &View, outcome: Outcome, width: usize, rich: bool)
     frame.gap();
     
     let (label, style) = match outcome {
-        Outcome::Success => ("complete", Style::new().green()),
-        Outcome::Cancelled => ("cancelled", Style::new().yellow()),
-        Outcome::Failed => ("failed", Style::new().red()),
+        Outcome::Success => ("complete", Style::default().green()),
+        Outcome::Cancelled => ("cancelled", Style::default().yellow()),
+        Outcome::Failed => ("failed", Style::default().red()),
     };
     frame.styled(&format!("{} {label}", task_title(&view.task)), style.bold());
     
@@ -375,7 +399,7 @@ pub(super) fn completed(view: &View, outcome: Outcome, width: usize, rich: bool)
             frame.gap();
             
             if !section.title.is_empty() {
-                frame.styled(section.title, Style::new().bold());
+                frame.styled(section.title, Style::default().bold());
             }
             
             for (label, value) in &section.fields {
@@ -417,7 +441,34 @@ pub(super) fn completed(view: &View, outcome: Outcome, width: usize, rich: bool)
         }
     }
     
-    frame.rows
+    frame.rows.into_iter().map(ansi).collect()
+}
+
+fn ansi(line: Line<'_>) -> String
+{
+    line.spans
+        .into_iter()
+        .map(|span| {
+            let mut style = ConsoleStyle::new();
+            style = match span.style.fg {
+                Some(Color::Cyan) => style.cyan(),
+                Some(Color::Green) => style.green(),
+                Some(Color::Yellow) => style.yellow(),
+                Some(Color::Red) => style.red(),
+                _ => style,
+            };
+
+            if span.style.add_modifier.contains(Modifier::BOLD) {
+                style = style.bold();
+            }
+
+            if span.style.add_modifier.contains(Modifier::DIM) {
+                style = style.dim();
+            }
+            
+            style.for_stderr().force_styling(span.style != Style::default()).apply_to(span.content).to_string()
+        })
+        .collect()
 }
 
 pub(super) fn plain(view: &View, final_snapshot: bool) -> Vec<String>
@@ -536,9 +587,14 @@ fn context<'a>(view: &'a View, key: &str) -> Option<&'a str>
     view.contexts.iter().find(|(label, _)| label == key).map(|(_, value)| value.as_str())
 }
 
-fn hint(view: &View) -> &'static str
+fn hint(view: &View, keyboard: bool) -> &'static str
 {
-    if view.task.eq_ignore_ascii_case("train") { "ctrl+c  stop safely" } else { "ctrl+c  cancel" }
+    match (view.task.eq_ignore_ascii_case("train"), keyboard) {
+        (true, true) => "q / ctrl+c  stop safely",
+        (true, false) => "ctrl+c  stop safely",
+        (false, true) => "q / ctrl+c  cancel",
+        (false, false) => "ctrl+c  cancel",
+    }
 }
 
 fn task_title(task: &str) -> &str

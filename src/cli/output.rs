@@ -2,12 +2,14 @@ use indicatif::{HumanBytes, HumanCount};
 
 use crate::{analyze, convert};
 
+#[derive(Clone)]
 pub struct CommandOutput
 {
     pub plain: String,
     pub sections: Vec<OutputSection>,
 }
 
+#[derive(Clone)]
 pub struct OutputSection
 {
     pub title: &'static str,
