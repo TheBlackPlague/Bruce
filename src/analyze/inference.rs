@@ -129,7 +129,7 @@ impl Inference
         let output = self.output_buffer.to_host().map_err(gpu_error).context("Cannot read network output")?;
 
         ensure!(output.f32().len() == BATCH_SIZE, "Network returned the wrong number of scores");
-        
+
         Ok(output.f32()[..positions.len()].to_vec())
     }
 }

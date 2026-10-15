@@ -81,10 +81,10 @@ pub fn validate_source(source: &DataSource, filter: Option<&Filter>) -> Result<(
 {
     let length = std::fs::metadata(&source.path).context("Could not open the dataset")?.len();
     ensure!(length > 0, "The dataset is empty");
-    
+
     if source.format == Format::Bullet {
         ensure!(length.is_multiple_of(size_of::<ChessBoard>() as u64), "The dataset is truncated");
-        
+
         if let Some(filter) = filter {
             ensure!(
                 filter.minimum_ply == 0
@@ -95,14 +95,14 @@ pub fn validate_source(source: &DataSource, filter: Option<&Filter>) -> Result<(
             );
         }
     }
-    
+
     if source.format == Format::Text {
         let separator = source.separator.as_deref().context("Text data needs a separator")?;
         ensure!(!separator.is_empty() && !separator.contains(['\n', '\r']), "Choose a nonempty text separator");
-        
+
         ensure!(filter.is_none_or(|filter| !filter.exclude_tactical), "Text data does not contain the played move");
     }
-    
+
     Ok(())
 }
 
@@ -114,10 +114,10 @@ pub fn validate(config: &DataConfig) -> Result<()>
             found |= source.format != Format::Sf || valid_sf_score(board.score);
             Ok(false)
         })?;
-        
+
         ensure!(found, "No positions pass the filter");
     }
-    
+
     Ok(())
 }
 
@@ -126,22 +126,22 @@ pub fn valid_sf_score(score: i16) -> bool { score != 32002 && score != i16::MIN 
 pub fn validate_board(board: &ChessBoard) -> Result<()>
 {
     ensure!(board.occ().count_ones() <= 32 && board.result <= 2, "Invalid position in the dataset");
-    
+
     let mut kings = [0; 2];
     for (piece, square) in *board {
         ensure!(piece & 7 < 6, "Invalid piece in the dataset");
-        
+
         if piece & 7 == 5 {
             let side = usize::from(piece >> 3);
             kings[side] += 1;
-            
+
             let expected = if side == 0 { board.ksq } else { board.opp_ksq ^ 56 };
             ensure!(square == expected, "Invalid king square in the dataset");
         }
     }
-    
+
     ensure!(kings == [1, 1], "A position must contain both kings");
-    
+
     Ok(())
 }
 
@@ -150,7 +150,7 @@ pub fn sf_board(entry: &sfbinpack::TrainingDataEntry) -> Result<ChessBoard>
     let mut bitboards = [0; 8];
     bitboards[0] = entry.pos.pieces_bb(Color::White).bits();
     bitboards[1] = entry.pos.pieces_bb(Color::Black).bits();
-    
+
     for (index, piece) in
         [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen, PieceType::King]
             .into_iter()
@@ -159,22 +159,22 @@ pub fn sf_board(entry: &sfbinpack::TrainingDataEntry) -> Result<ChessBoard>
         bitboards[index + 2] = entry.pos.pieces_bb_color(Color::White, piece).bits()
             | entry.pos.pieces_bb_color(Color::Black, piece).bits();
     }
-    
+
     ensure!((-1..=1).contains(&entry.result), "Invalid result in the dataset");
-    
+
     let mut board = ChessBoard::from_raw(bitboards, usize::from(entry.pos.side_to_move() == Color::Black), 0, 0.5)
         .map_err(|_| anyhow::anyhow!("Invalid SF position"))?;
-    
+
     board.score = entry.score;
     board.result = (entry.result + 1) as u8;
-    
+
     Ok(board)
 }
 
 fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 {
     use sfbinpack::chess::{r#move::MoveType, piece::Piece};
-    
+
     matches!(entry.mv.mtype(), MoveType::EnPassant | MoveType::Promotion)
         || (entry.mv.mtype() != MoveType::Castle && entry.pos.piece_at(entry.mv.to()) != Piece::none())
 }
@@ -182,10 +182,10 @@ fn sf_tactical(entry: &sfbinpack::TrainingDataEntry) -> bool
 pub fn parse_board(fen: &str) -> Result<Board>
 {
     bullet_lib::game::formats::viriformat::chess::CHESS960.store(true, Ordering::Relaxed);
-    
+
     let mut fields = fen.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
     ensure!(fields.len() == 6, "Invalid FEN in the dataset");
-    
+
     fields[2] = fields[2]
         .chars()
         .map(|right| match right {
@@ -200,26 +200,26 @@ pub fn parse_board(fen: &str) -> Result<Board>
         fields[2].chars().all(|right| right == '-' || ('A'..='H').contains(&right) || ('a'..='h').contains(&right)),
         "Invalid castling rights"
     );
-    
+
     let mut board = Board::new();
     board.set_from_fen(&fields.join(" "))?;
-    
+
     Ok(board)
 }
 
 pub fn viri_fen(board: &Board) -> String
 {
     let mut fields = board.to_string().split_whitespace().map(str::to_owned).collect::<Vec<_>>();
-    
+
     let rights = board.castling_rights();
-    
+
     let mut encoded = String::new();
     for (square, base) in [(rights.wk, b'A'), (rights.wq, b'A'), (rights.bk, b'a'), (rights.bq, b'a')] {
         if let Some(square) = square {
             encoded.push(char::from(base + square.inner() % 8));
         }
     }
-    
+
     fields[2] = if encoded.is_empty() { "-".into() } else { encoded };
     fields.join(" ")
 }
@@ -238,7 +238,7 @@ fn square_name(square: u8) -> String { format!("{}{}", char::from(b'a' + square 
 pub fn monty_fen(position: &Position, castling: &Castling) -> String
 {
     let mut fields = position.as_fen().split_whitespace().map(str::to_owned).collect::<Vec<_>>();
-    
+
     let mut rights = String::new();
     for (mask, side, flank) in [(4, 0, 1), (8, 0, 0), (1, 1, 1), (2, 1, 0)] {
         if position.rights() & mask != 0 {
@@ -246,7 +246,7 @@ pub fn monty_fen(position: &Position, castling: &Castling) -> String
         }
     }
     fields[2] = if rights.is_empty() { "-".into() } else { rights };
-    
+
     fields[3] = if position.enp_sq() == 0 { "-".into() } else { square_name(position.enp_sq()) };
     fields.join(" ")
 }
@@ -259,7 +259,7 @@ pub fn monty_uci(mov: Move, castling: &Castling) -> String
     } else {
         mov.to() as u8
     };
-    
+
     let promotion = if mov.is_promo() { ["n", "b", "r", "q"][(mov.flag() & 3) as usize] } else { "" };
     format!("{}{}{promotion}", square_name(mov.src() as u8), square_name(destination))
 }
@@ -270,33 +270,33 @@ pub fn bullet_fen(board: &ChessBoard) -> String
     for (piece, square) in *board {
         squares[usize::from(square)] = b"PNBRQKpnbrqk"[usize::from((piece & 7) + 6 * (piece >> 3))];
     }
-    
+
     let mut fen = String::with_capacity(90);
     for rank in (0..8).rev() {
         if rank < 7 {
             fen.push('/');
         }
-        
+
         let mut empty = 0;
         for &piece in &squares[rank * 8..rank * 8 + 8] {
             if piece == b' ' {
                 empty += 1;
                 continue;
             }
-            
+
             if empty > 0 {
                 fen.push(char::from(b'0' + empty));
                 empty = 0;
             }
-            
+
             fen.push(char::from(piece));
         }
-        
+
         if empty > 0 {
             fen.push(char::from(b'0' + empty));
         }
     }
-    
+
     fen.push_str(" w - - 0 1");
     fen
 }

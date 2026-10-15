@@ -21,17 +21,17 @@ impl TensorBoard
             !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
             "Invalid run name"
         );
-        
+
         let directory = root.join(name);
         fs::create_dir_all(&directory)?;
-        
+
         let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = directory.join(format!("events.out.tfevents.{time}.{}.bruce", std::process::id()));
-        
+
         let mut writer = Self { writer: BufWriter::new(File::create_new(path)?) };
         writer.write(Event { file_version: Some("brain.Event:2".into()), ..Event::at(0) })?;
         writer.flush()?;
-        
+
         Ok(writer)
     }
 
@@ -52,12 +52,12 @@ impl TensorBoard
     {
         let bytes = event.encode_to_vec();
         let length = (bytes.len() as u64).to_le_bytes();
-        
+
         self.writer.write_all(&length)?;
         self.writer.write_all(&checksum(&length))?;
         self.writer.write_all(&bytes)?;
         self.writer.write_all(&checksum(&bytes))?;
-        
+
         Ok(())
     }
 }

@@ -38,15 +38,15 @@ impl TrainingProgress
         self.positions_per_second = None;
         self.superbatch_eta = None;
         self.run_eta = None;
-        
+
         let rate = self.session_batches as f64 / self.elapsed.as_secs_f64();
         if !rate.is_finite() || rate <= 0.0 {
             return;
         }
-        
+
         let positions = rate * batch_size as f64;
         self.positions_per_second = positions.is_finite().then_some(positions);
-        
+
         let batches_left = self.batches_per_superbatch.saturating_sub(self.batch);
         let run_left = self
             .final_superbatch
@@ -115,9 +115,9 @@ impl TrainingMetrics
             TrainingEvent::BatchCompleted { step, loss, learning_rate, elapsed, .. } => {
                 self.window.add(*loss);
                 self.session.add(*loss);
-                
+
                 let batch = step.batch() + 1;
-                
+
                 let mut progress = TrainingProgress {
                     superbatch: step.superbatch(),
                     final_superbatch: step.final_superbatch(),
@@ -134,9 +134,9 @@ impl TrainingMetrics
                     run_eta: None,
                 };
                 progress.update_rates(self.batch_size);
-                
+
                 self.latest = Some(progress);
-                
+
                 let sample_due =
                     batch == 1 || batch == step.batches_per_superbatch() || batch.is_multiple_of(self.log_every);
                 return Observation { progress: self.latest, sample: if sample_due { self.finish() } else { None } };
@@ -146,7 +146,7 @@ impl TrainingMetrics
                     progress.elapsed = elapsed.saturating_sub(self.setup);
                     progress.update_rates(self.batch_size);
                 }
-                
+
                 return Observation { progress: self.latest, sample: None };
             },
             _ => {},
@@ -162,9 +162,9 @@ impl TrainingMetrics
     {
         let progress = self.latest?;
         let loss = self.window.value()? as f32;
-        
+
         self.window = Average::default();
-        
+
         Some(MetricSample {
             step: i64::try_from(progress.global_batch).ok()?,
             loss,

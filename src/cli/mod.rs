@@ -541,7 +541,7 @@ impl Shared
 
             let view = state.view.clone();
             let messages = std::mem::take(&mut state.messages);
-            
+
             state.redraw();
             drop(state);
 
@@ -608,7 +608,7 @@ impl Shared
 
         if terminal.poll_stop()? {
             let mut state = lock(&self.state);
-            
+
             if let Some(stop) = &state.stop {
                 stop.store(true, Ordering::Release);
                 state.acknowledge_stop();
@@ -718,20 +718,23 @@ impl Output
 {
     fn new(options: OutputOptions) -> Self
     {
-        let interactive = options.display != DisplayMode::Plain
-            && io::stderr().is_terminal()
+        let interactive = io::stderr().is_terminal()
             && io::stdout().is_terminal()
-            && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
-            && std::env::var_os("CI").is_none();
+            && !std::env::var("TERM").is_ok_and(|term| term == "dumb");
 
-        let live = interactive && options.verbosity != Verbosity::Quiet;
-
-        let color = interactive
-            && match options.color {
-                ColorMode::Always => true,
-                ColorMode::Never => false,
-                ColorMode::Auto => !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        let live = interactive
+            && options.verbosity != Verbosity::Quiet
+            && match options.display {
+                DisplayMode::Auto => std::env::var_os("CI").is_none(),
+                DisplayMode::Live => true,
+                DisplayMode::Plain => false,
             };
+
+        let color = match options.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => interactive && !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        };
 
         Self { live, color, verbosity: options.verbosity }
     }

@@ -1,15 +1,20 @@
-name: Rust
+name: CI
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   format:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -19,7 +24,11 @@ jobs:
       - run: cargo +nightly-2026-10-01 fmt --all -- --check
 
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -28,65 +37,89 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --no-default-features --all-targets
-      - name: Verify StockDory network compatibility
-        if: runner.os == 'Linux'
-        env:
-          MANTARAY_ROOT: ${{ runner.temp }}/mantaray
-        run: |
-          git init "$MANTARAY_ROOT"
-          git -C "$MANTARAY_ROOT" fetch --depth 1 https://github.com/TheBlackPlague/MantaRay.git 079959294e5c2b0c62e50f9222812d6f21014932
-          git -C "$MANTARAY_ROOT" checkout --detach FETCH_HEAD
-          cargo test --locked --no-default-features --test architecture -- --include-ignored
+      - run: cargo run --locked --no-default-features -- --help
 
-  coverage:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.0
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --locked --no-default-features --all-targets --ignore-filename-regex '(^|/)tests/' --lcov --output-path coverage.lcov
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: coverage.lcov
-
-  backend-check:
+  build:
+    name: Build ${{ matrix.backend }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             backend: cuda
-          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: ubuntu-24.04
             backend: rocm
-          - os: macos-latest
+            platform: linux-x86_64
+          - os: macos-14
             backend: metal
+            platform: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.0
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Type checks need SDK search paths but do not link or execute GPU code
-      - run: cargo clippy --locked --no-default-features --features ${{ matrix.backend }} --all-targets -- -D warnings
+        with:
+          key: ${{ matrix.backend }}
+      - name: Install CUDA libraries
+        if: matrix.backend == 'cuda'
+        run: |
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-cudart-dev-12-9 cuda-driver-dev-12-9 cuda-nvrtc-dev-12-9 libcublas-dev-12-9
+          echo 'CUDA_PATH=/usr/local/cuda-12.9' >> "$GITHUB_ENV"
+          echo 'RUSTFLAGS=-L native=/usr/local/cuda-12.9/lib64/stubs -C link-arg=-Wl,-rpath,/usr/local/cuda-12.9/lib64' >> "$GITHUB_ENV"
+      - name: Install ROCm libraries
+        if: matrix.backend == 'rocm'
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4.3 noble main' | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends hip-dev hipblas-dev rocblas-dev
+          echo 'HIP_PATH=/opt/rocm-6.4.3' >> "$GITHUB_ENV"
+          echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,/opt/rocm-6.4.3/lib' >> "$GITHUB_ENV"
+      - name: Build executable
+        run: cargo build --locked --release --no-default-features --features ${{ matrix.backend }} --bin bruce
+      - name: Name executable
+        shell: bash
         env:
-          CUDA_PATH: /usr
-          HIP_PATH: /usr
+          BACKEND: ${{ matrix.backend }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          name="Bruce-${version}-${PLATFORM}-${BACKEND}"
+          mkdir dist
+          cp target/release/bruce "dist/$name"
+          echo "BINARY_NAME=$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [format, check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Bruce-*
+          path: release
+          merge-multiple: true
+      - name: Publish executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          fi

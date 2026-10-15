@@ -119,22 +119,22 @@ impl Statistics
     {
         let report = &mut self.report;
         report.positions += 1;
-        
+
         let score = f64::from(board.score);
         let previous_delta = score - report.scores.mean_cp;
-        
+
         update_mean(&mut report.scores.mean_cp, score, report.positions);
-        
+
         self.score_deviations += previous_delta * (score - report.scores.mean_cp);
-        
+
         let score_index = (i32::from(board.score) - i32::from(i16::MIN)) as usize;
         self.score_counts[score_index] += 1;
-        
+
         report.results.record(board.result);
 
         let group = report.material.entry(board.occ.count_ones()).or_default();
         group.positions += 1;
-        
+
         update_mean(&mut group.mean_score_cp, score, group.positions);
         group.results.record(board.result);
     }
@@ -142,38 +142,38 @@ impl Statistics
     pub(super) fn prediction(&mut self, board: &ChessBoard, output: f32) -> Result<()>
     {
         ensure!(output.is_finite(), "Network produced an invalid score");
-        
+
         let network = self.report.network.as_mut().expect("Network statistics require an architecture");
-        
+
         let prediction_cp = f64::from(output) * f64::from(SCALE);
-        
+
         network.overall.record(board, prediction_cp);
         network.by_piece_count.entry(board.occ.count_ones()).or_default().record(board, prediction_cp);
         let score_bucket = i32::from(board.score).div_euclid(SCORE_BUCKET) * SCORE_BUCKET;
         network.by_teacher_score_cp.entry(score_bucket).or_default().record(board, prediction_cp);
 
         let probability = sigmoid(f64::from(output));
-        
+
         let bucket = ((probability * PROBABILITY_BUCKETS as f64) as usize).min(PROBABILITY_BUCKETS - 1);
-        
+
         let calibration = &mut network.calibration[bucket];
         calibration.positions += 1;
-        
+
         update_mean(&mut calibration.mean_prediction, probability, calibration.positions);
         update_mean(&mut calibration.mean_result, f64::from(board.result) / 2.0, calibration.positions);
-        
+
         let threshold = network.extreme_probability_threshold;
         if probability < threshold || probability > 1.0 - threshold {
             network.extreme_predictions += 1;
         }
-        
+
         Ok(())
     }
 
     pub(super) fn finish(mut self, limit: Option<u64>) -> Report
     {
         let report = &mut self.report;
-        
+
         report.limit_reached = limit == Some(report.positions);
         report.score_distribution = self
             .score_counts
@@ -185,24 +185,24 @@ impl Statistics
         report.scores.standard_deviation_cp = (self.score_deviations / report.positions.max(1) as f64).sqrt();
         report.scores.minimum_cp = report.score_distribution.first_key_value().map_or(0, |(&score, _)| score);
         report.scores.maximum_cp = report.score_distribution.last_key_value().map_or(0, |(&score, _)| score);
-        
+
         let mut percentiles = [1_u8, 5, 25, 50, 75, 95, 99].into_iter().peekable();
-        
+
         let mut count = 0;
         for (&score, &frequency) in &report.score_distribution {
             count += frequency;
             while let Some(&percentile) = percentiles.peek() {
                 let rank = (u128::from(report.positions) * u128::from(percentile)).div_ceil(100);
-                
+
                 if u128::from(count) < rank {
                     break;
                 }
-                
+
                 report.scores.percentiles_cp.insert(percentile, score);
                 percentiles.next();
             }
         }
-        
+
         self.report
     }
 }
@@ -233,7 +233,7 @@ impl NetworkReport
                 mean_result: 0.0,
             })
             .collect();
-        
+
         Self {
             architecture,
             weights: "native_float_checkpoint",
@@ -253,18 +253,18 @@ impl ErrorSummary
     fn record(&mut self, board: &ChessBoard, prediction: f64)
     {
         self.positions += 1;
-        
+
         let error = prediction - f64::from(board.score);
         let probability = sigmoid(prediction / f64::from(SCALE));
         let teacher = sigmoid(f64::from(board.score) / f64::from(SCALE));
         let result = f64::from(board.result) / 2.0;
-        
+
         update_mean(&mut self.mean_prediction_cp, prediction, self.positions);
         update_mean(&mut self.bias_cp, error, self.positions);
         update_mean(&mut self.mean_absolute_error_cp, error.abs(), self.positions);
         update_mean(&mut self.result_squared_error, (probability - result).powi(2), self.positions);
         update_mean(&mut self.teacher_probability_squared_error, (probability - teacher).powi(2), self.positions);
-        
+
         self.squared_error_sum += error * error;
         self.root_mean_squared_error_cp = (self.squared_error_sum / self.positions as f64).sqrt();
     }

@@ -82,9 +82,8 @@ impl Terminal
                 self.screen.set_cursor_position(origin)?;
 
                 let backend = CrosstermBackend::new(io::stderr());
-                let screen = ratatui::Terminal::with_options(backend, TerminalOptions {
-                    viewport: Viewport::Inline(height),
-                })?;
+                let screen =
+                    ratatui::Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(height) })?;
 
                 self.screen = screen;
                 self.height = height;

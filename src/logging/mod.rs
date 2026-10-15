@@ -59,7 +59,7 @@ impl Logger
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             fs::create_dir_all(parent).with_context(|| format!("Cannot create log directory {}", parent.display()))?;
         }
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -77,15 +77,15 @@ impl Logger
                 Err(error) => {
                     let warning = tensorboard_warning(error);
                     write_message(&mut writer, &format!("Warning: {warning}"))?;
-                    
+
                     diagnostics.lock().unwrap().warnings.push(warning);
-                    
+
                     None
                 },
             },
             None => None,
         };
-        
+
         writer.flush().context("Cannot begin the text log; check free space and permissions")?;
 
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
@@ -124,7 +124,7 @@ impl Logger
             && let Err(TrySendError::Full(_)) = sender.try_send(Record::Sample(sample))
         {
             let mut diagnostics = self.session.diagnostics.lock().unwrap();
-            
+
             diagnostics.dropped_for_display = diagnostics.dropped_for_display.saturating_add(1);
             diagnostics.dropped_for_log = diagnostics.dropped_for_log.saturating_add(1);
         }
@@ -133,21 +133,21 @@ impl Logger
     pub fn take_diagnostics(&self) -> Vec<String>
     {
         let mut diagnostics = self.session.diagnostics.lock().unwrap_or_else(|error| error.into_inner());
-        
+
         let mut messages = std::mem::take(&mut diagnostics.warnings);
-        
+
         let dropped = std::mem::take(&mut diagnostics.dropped_for_display);
         if dropped > 0 {
             messages.push(dropped_message(dropped));
         }
-        
+
         if !diagnostics.failure_reported
             && let Some(failure) = &diagnostics.failure
         {
             messages.push(format!("Text logging failed: {failure}"));
             diagnostics.failure_reported = true;
         }
-        
+
         messages
     }
 
@@ -165,18 +165,18 @@ impl Session
     fn finish(&self) -> Result<()>
     {
         let mut worker = self.worker.lock().unwrap_or_else(|error| error.into_inner());
-        
+
         self.sender.lock().unwrap_or_else(|error| error.into_inner()).take();
-        
+
         if let Some(worker) = worker.take()
             && worker.join().is_err()
         {
             self.diagnostics.lock().unwrap_or_else(|error| error.into_inner()).failure =
                 Some("Text log worker panicked".into());
         }
-        
+
         let status = self.diagnostics.lock().unwrap_or_else(|error| error.into_inner());
-        
+
         match &status.failure {
             Some(failure) => Err(anyhow!(failure.clone())),
             None => Ok(()),
@@ -201,7 +201,7 @@ fn write_records(
     loop {
         let received = receiver.recv_timeout(FLUSH_INTERVAL.saturating_sub(flushed.elapsed()));
         let closing = matches!(received, Err(RecvTimeoutError::Disconnected));
-        
+
         match received {
             Ok(Record::Message(message)) => write_message(&mut writer, &message)?,
             Ok(Record::Sample(sample)) => {
@@ -214,7 +214,7 @@ fn write_records(
                     sample.learning_rate,
                     sample.speed
                 )?;
-                
+
                 tensorboard_action(&mut tensorboard, diagnostics, &mut writer, |board| {
                     board.sample(sample.step, sample.loss, sample.learning_rate, sample.speed)
                 })?;
@@ -227,17 +227,17 @@ fn write_records(
             if dropped > 0 {
                 write_message(&mut writer, &format!("Warning: {}", dropped_message(dropped)))?;
             }
-            
+
             tensorboard_action(&mut tensorboard, diagnostics, &mut writer, TensorBoard::flush)?;
-            
+
             if closing {
                 write_message(&mut writer, &format!("Session {session} closed"))?;
             }
-            
+
             writer.flush().context("Cannot flush the text log; check free space and permissions")?;
             flushed = Instant::now();
         }
-        
+
         if closing {
             return Ok(());
         }
@@ -259,7 +259,7 @@ fn tensorboard_action(
         diagnostics.lock().unwrap().warnings.push(warning.clone());
         write_message(writer, &format!("Warning: {warning}"))?;
     }
-    
+
     Ok(())
 }
 
@@ -289,14 +289,14 @@ fn write_message(writer: &mut impl Write, text: &str) -> Result<()>
     for line in clean_text(text).lines() {
         writeln!(writer, "[{}] {line}", timestamp()).context("Cannot write the text log")?;
     }
-    
+
     Ok(())
 }
 
 pub(crate) fn clean_text(text: &str) -> String
 {
     let mut clean = String::with_capacity(text.len());
-    
+
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
@@ -322,6 +322,6 @@ pub(crate) fn clean_text(text: &str) -> String
             _ => {},
         }
     }
-    
+
     clean
 }

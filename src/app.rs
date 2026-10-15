@@ -149,7 +149,7 @@ pub fn run() -> ExitCode
         Ok(outcome) => outcome,
         Err(error) if error.is::<Cancelled>() => Outcome::Cancelled,
         Err(error) => {
-            reporter.error(&error.to_string(), recovery(task), &format!("{error:#}"));
+            reporter.error(&format!("{error:#}"), recovery(task), "");
             Outcome::Failed
         },
     };

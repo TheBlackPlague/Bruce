@@ -42,39 +42,39 @@ pub fn check_reported(config: &Config, reporter: &Reporter, stop: Arc<AtomicBool
     reporter.set_stop_flag(stop.clone());
 
     config.validate()?;
-    
+
     let mut positions = 0u64;
     for source in &config.data.sources {
         if stop.load(Ordering::Relaxed) {
             return Ok(Outcome::Cancelled);
         }
-        
+
         reporter.context("Dataset", source.path.to_string_lossy());
         reporter.phase("Validating dataset");
-        
+
         let mut accepted = 0u64;
         data::visit_boards_stoppable(source, config.data.filter.as_ref(), &stop, |board| {
             if source.format != Format::Sf || data::valid_sf_score(board.score) {
                 positions += 1;
                 accepted += 1;
-                
+
                 if positions.is_multiple_of(4096) {
                     reporter.progress(Progress::Work { completed: positions, total: None, unit: "positions checked" });
                 }
             }
-            
+
             Ok(false)
         })?;
-        
+
         reporter.progress(Progress::Work { completed: positions, total: None, unit: "positions checked" });
-        
+
         if stop.load(Ordering::Relaxed) {
             return Ok(Outcome::Cancelled);
         }
-        
+
         ensure!(accepted > 0, "No positions pass the filter; check the dataset and filter settings");
     }
-    
+
     Ok(Outcome::Success)
 }
 
@@ -84,28 +84,28 @@ pub fn run(config: Config, resume: Option<PathBuf>, plain: bool) -> Result<()>
         display: if plain { DisplayMode::Plain } else { DisplayMode::Auto },
         ..OutputOptions::default()
     });
-    
+
     let stop = Arc::new(AtomicBool::new(false));
-    
+
     reporter.start("Train", &config.name);
     reporter.set_stop_flag(stop.clone());
-    
+
     let result = (|| {
         config.validate()?;
-        
+
         let path = PathBuf::from("logs").join(format!("{}.log", config.name));
         let tensorboard =
             config.tensorboard.enabled.then_some((config.tensorboard.path.as_path(), config.name.as_str()));
-        
+
         reporter.attach_log(Logger::open(&path, tensorboard)?);
         reporter.context("Log", path.to_string_lossy());
-        
+
         if cfg!(any(feature = "cuda", feature = "rocm", feature = "metal")) {
             let signal = stop.clone();
             ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
                 .context("Could not handle stop requests")?;
         }
-        
+
         run_reported(config, resume, &reporter, stop)
     })();
     match result {
@@ -114,7 +114,7 @@ pub fn run(config: Config, resume: Option<PathBuf>, plain: bool) -> Result<()>
             if outcome == Outcome::Cancelled {
                 bail!("Training cancelled; resume from the latest saved checkpoint");
             }
-            
+
             Ok(())
         },
         Err(error) => {
@@ -128,7 +128,7 @@ pub fn run(config: Config, resume: Option<PathBuf>, plain: bool) -> Result<()>
                 );
                 reporter.finish(Outcome::Failed).context("Could not finalize reporting after training failed")?;
             }
-            
+
             Err(error)
         },
     }
@@ -144,31 +144,31 @@ pub fn run_reported(
     reporter.set_stop_flag(stop.clone());
 
     config.validate()?;
-    
+
     if !cfg!(any(feature = "cuda", feature = "rocm", feature = "metal")) {
         bail!("Training needs a GPU build; enable cuda, rocm, or metal");
     }
-    
+
     if stop.load(Ordering::Relaxed) {
         return Ok(Outcome::Cancelled);
     }
-    
+
     reporter.context("Device", format!("GPU {}", config.device));
     reporter.context("Checkpoints", config.training.checkpoint.location.to_string_lossy());
     reporter.verbose(&format!("Configuration: {}", config.checkpoint_value()));
     reporter.phase("Checking training data");
-    
+
     let architecture: Architecture = config.architecture.parse()?;
-    
+
     let reader = DatasetReader::new(&config.data, config.seed, stop.clone())?;
-    
+
     if stop.load(Ordering::Relaxed) {
         return Ok(Outcome::Cancelled);
     }
-    
+
     reporter.phase("Checking dataset identity for checkpoints");
     let checkpoints = Checkpoints::new(&config)?;
-    
+
     reporter.phase("Checking checkpoint destinations");
     let completed = resume.as_ref().map(|path| checkpoints.inspect(path)).transpose()?.unwrap_or(0);
     for superbatch in completed + 1..=config.training.superbatches {
@@ -176,33 +176,33 @@ pub fn run_reported(
             checkpoints.check_destination(superbatch)?;
         }
     }
-    
+
     if stop.load(Ordering::Relaxed) {
         return Ok(Outcome::Cancelled);
     }
-    
+
     reporter.phase("Preparing network and GPU");
-    
+
     let definition = architecture.definition();
     let weights = ModelWeights::new(&definition, config.seed);
-    
+
     let device = Device::<ExecutionContext>::new(config.device)
         .map_err(|error| anyhow::anyhow!("{error:?}"))
         .context("Could not open the GPU; check the device number and GPU driver")?;
-    
+
     let mut trainer = Trainer::new(definition, weights, device, config.optimizer.params())
         .map_err(|error| anyhow::anyhow!("{error:?}"))
         .context("Could not prepare training; check GPU memory and the network configuration")?;
-    
+
     if stop.load(Ordering::Relaxed) {
         return Ok(Outcome::Cancelled);
     }
-    
+
     if let Some(path) = &resume {
         reporter.phase("Restoring checkpoint");
         checkpoint::restore(&mut trainer, path)?;
         reporter.context("Resumed checkpoint", path.to_string_lossy());
-        
+
         let exact =
             config.data.filter.is_none() && config.data.sources.iter().all(|source| source.format == Format::Bullet);
         reporter.notice(if exact {
@@ -211,35 +211,35 @@ pub fn run_reported(
             "Resuming weights and schedule; data order may change"
         });
     }
-    
+
     if stop.load(Ordering::Relaxed) {
         return Ok(Outcome::Cancelled);
     }
-    
+
     let steps = TrainingSteps {
         batch_size: config.data.batch_size,
         batches_per_superbatch: BATCHES_PER_SUPERBATCH,
         start_superbatch: completed + 1,
         end_superbatch: config.training.superbatches,
     };
-    
+
     let mut metrics = TrainingMetrics::new(steps, config.training.log_every);
-    
+
     let loader =
         ReadMapLoader::new(reader.clone(), architecture.mapper(config.wdl.clone()), config.data.mapping_threads);
-    
+
     let schedule = TrainingSchedule {
         steps,
         lr_schedule: config.learning_rate.clone().boxed(),
         log_rate: config.training.log_every,
     };
-    
+
     let format = architecture.saved_format();
     let state =
         RefCell::new(TrainingState { latest_checkpoint: resume, checkpoint_error: None, nonfinite_loss: false });
-    
+
     reporter.phase("Compiling training and loading first batch");
-    
+
     let result = train_with_observer(
         &mut trainer,
         schedule,
@@ -257,24 +257,24 @@ pub fn run_reported(
         },
         &mut |event| report_training_event(event, &mut metrics, reporter),
     );
-    
+
     if let Some(sample) = metrics.finish() {
         reporter.sample(sample);
     }
-    
+
     if let Some(progress) = metrics.progress() {
         reporter.progress(Progress::Training(progress));
     }
-    
+
     if let Some(loss) = metrics.run_loss() {
         reporter.set_training_loss(loss);
     }
-    
+
     let state = state.into_inner();
     if let Some(path) = &state.latest_checkpoint {
         reporter.context("Latest checkpoint", path.to_string_lossy());
     }
-    
+
     let outcome = resolve_outcome(
         result,
         state.checkpoint_error,
@@ -282,11 +282,11 @@ pub fn run_reported(
         state.nonfinite_loss,
         stop.load(Ordering::Relaxed),
     )?;
-    
+
     if outcome == Outcome::Cancelled && state.latest_checkpoint.is_none() {
         reporter.warning("No checkpoint was saved; the next training invocation will start from the beginning.");
     }
-    
+
     Ok(outcome)
 }
 
@@ -307,7 +307,7 @@ impl TrainingState
                     "Loss is not finite; stopping without saving invalid weights. Check the data and learning rate.",
                 );
             }
-            
+
             self.nonfinite_loss = true;
             stop.store(true, Ordering::Relaxed);
         }
@@ -326,7 +326,7 @@ impl TrainingState
         if self.nonfinite_loss || self.checkpoint_error.is_some() {
             return;
         }
-        
+
         reporter.phase("Saving checkpoint");
         match checkpoints.save(trainer, format, superbatch) {
             Ok(path) => {
@@ -344,7 +344,7 @@ impl TrainingState
                 stop.store(true, Ordering::Relaxed);
             },
         }
-        
+
         if stop.load(Ordering::Relaxed) {
             reporter.stopping();
         } else {
@@ -364,13 +364,13 @@ fn report_training_event(event: &TrainingEvent, metrics: &mut TrainingMetrics, r
         TrainingEvent::RunCompleted { .. } => reporter.phase("Finalizing training"),
         _ => {},
     }
-    
+
     let update = metrics.observe(event);
-    
+
     if let Some(progress) = update.progress {
         reporter.progress(Progress::Training(progress));
     }
-    
+
     if let Some(sample) = update.sample {
         reporter.sample(sample);
     }
@@ -387,15 +387,15 @@ fn resolve_outcome(
     if let Some(error) = checkpoint_error {
         return Err(error);
     }
-    
+
     if let Some(error) = dataset_error {
         return Err(anyhow::anyhow!(error).context("Could not read the dataset; validate it with train --check"));
     }
-    
+
     if nonfinite_loss {
         bail!("Training stopped because the loss is not finite; check the data and learning rate before resuming");
     }
-    
+
     match result {
         Ok(()) if stopping => Ok(Outcome::Cancelled),
         Ok(()) => Ok(Outcome::Success),
