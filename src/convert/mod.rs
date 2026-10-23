@@ -1,5 +1,6 @@
 mod encode;
 mod games;
+mod sf;
 
 use std::{
     fs::File,
@@ -12,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::{
     cli::{self, Progress, Reporter},
@@ -37,6 +38,41 @@ pub struct Options
     pub separator: Option<String>,
     #[arg(long)]
     pub threads: Option<usize>,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "preserve",
+        help = "Preserve scores or convert BT4 Q scores to Monty's scale (SF input only)"
+    )]
+    pub score_encoding: ScoreEncoding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ScoreEncoding
+{
+    Preserve,
+    Bt4Q,
+}
+
+impl ScoreEncoding
+{
+    fn convert(self, score: i16) -> Result<i16>
+    {
+        if self == Self::Preserve {
+            return Ok(score);
+        }
+
+        ensure!((-32000..=32000).contains(&score), "Invalid BT4 Q score: {score}");
+
+        match score {
+            -32000 => Ok(-i16::MAX),
+            32000 => Ok(i16::MAX),
+            _ => {
+                let score = f64::from(score);
+                Ok((400.0 * ((32000.0 + score) / (32000.0 - score)).ln()).round() as i16)
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -128,6 +164,10 @@ fn convert(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Result<
 
     let threads = options.threads.unwrap_or(1);
     ensure!((1..=256).contains(&threads), "Threads must be between 1 and 256");
+    ensure!(
+        options.score_encoding == ScoreEncoding::Preserve || options.from == Format::Sf,
+        "BT4 Q score conversion requires --from sf"
+    );
 
     ensure!(!options.output.exists(), "The output file already exists");
     if options.from == Format::Text || options.to == Format::Text {
@@ -146,7 +186,7 @@ fn convert(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Result<
 
     let mut summary =
         Summary { positions: 0, skipped: 0, input_bytes: std::fs::metadata(&options.input)?.len(), output_bytes: 0 };
-    if options.from == options.to {
+    if options.from == options.to && options.score_encoding == ScoreEncoding::Preserve {
         summary.positions = copy(&source, temporary.as_file_mut(), summary.input_bytes, reporter, stop)?;
     } else {
         reporter.phase("Converting positions");
@@ -165,7 +205,9 @@ fn convert(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Result<
         }
 
         let mut writer = BufWriter::new(temporary.as_file_mut());
-        if matches!((options.from, options.to), (Format::Monty, Format::Viri) | (Format::Viri, Format::Monty)) {
+        if options.from == Format::Sf {
+            sf::convert(options, threads, &mut writer, reporter, stop, &mut summary)?;
+        } else if matches!((options.from, options.to), (Format::Monty, Format::Viri) | (Format::Viri, Format::Monty)) {
             summary.positions = games::convert(options, threads, &mut writer, reporter, stop)?;
         } else {
             convert_records(&source, options, threads, &mut writer, reporter, stop, &mut summary)?;
@@ -192,10 +234,7 @@ fn convert(options: &Options, reporter: &Reporter, stop: &AtomicBool) -> Result<
         .context("Could not publish the converted dataset; check the destination permissions and free space")?;
 
     if summary.skipped > 0 {
-        reporter.warning(&format!(
-            "Skipped {} positions with scores that cannot be represented in the output",
-            summary.skipped
-        ));
+        reporter.warning(&format!("Skipped {} positions without usable scores", summary.skipped));
     }
 
     Ok(summary)
@@ -214,11 +253,6 @@ fn convert_records(
     let mut records = Vec::with_capacity(8192);
     let (_, skipped) = data::visit_counted_stoppable(source, stop, |record| {
         check_stop(stop)?;
-
-        if options.from == Format::Sf && options.to == Format::Viri && i16::try_from(record.white_score()).is_err() {
-            summary.skipped += 1;
-            return Ok(false);
-        }
 
         records.push(record);
         if records.len() == 8192 {
