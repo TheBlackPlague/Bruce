@@ -25,6 +25,8 @@ pub enum Architecture
     Aurora,
     #[serde(alias = "Flare")]
     Flare,
+    #[serde(alias = "Corona")]
+    Corona,
 }
 
 type Inputs = ModelInputs<((SparseInput, SparseInput), DenseInput<f32>)>;
@@ -42,6 +44,7 @@ impl Architecture
             Self::Starshard => "Starshard",
             Self::Aurora => "Aurora",
             Self::Flare => "Flare",
+            Self::Corona => "Corona"
         }
     }
 
@@ -50,7 +53,7 @@ impl Architecture
         match self {
             Self::Starshard => 256,
             Self::Aurora => 384,
-            Self::Flare => 768,
+            Self::Flare | Self::Corona => 768,
         }
     }
 
@@ -65,8 +68,10 @@ impl Architecture
             let y0 = l0.forward(stm);
             let y1 = l0.forward(ntm);
 
-            let y0 = y0.crelu();
-            let y1 = y1.crelu();
+            let (y0, y1) = match self {
+                Self::Starshard | Self::Aurora | Self::Flare => (y0.crelu(), y1.crelu()),
+                _ => (y0.screlu(), y1.screlu())
+            };
 
             let y0 = y0.concat(y1);
 
@@ -125,6 +130,7 @@ impl FromStr for Architecture
             "starshard" => Ok(Self::Starshard),
             "aurora" => Ok(Self::Aurora),
             "flare" => Ok(Self::Flare),
+            "corona" => Ok(Self::Corona),
             _ => anyhow::bail!("Unknown architecture '{value}'"),
         }
     }
