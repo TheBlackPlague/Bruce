@@ -27,6 +27,8 @@ pub enum Architecture
     Flare,
     #[serde(alias = "Corona")]
     Corona,
+    #[serde(alias = "Eclipse")]
+    Eclipse,
 }
 
 type Inputs = ModelInputs<((SparseInput, SparseInput), DenseInput<f32>)>;
@@ -44,7 +46,8 @@ impl Architecture
             Self::Starshard => "Starshard",
             Self::Aurora => "Aurora",
             Self::Flare => "Flare",
-            Self::Corona => "Corona"
+            Self::Corona => "Corona",
+            Self::Eclipse => "Eclipse",
         }
     }
 
@@ -54,6 +57,7 @@ impl Architecture
             Self::Starshard => 256,
             Self::Aurora => 384,
             Self::Flare | Self::Corona => 768,
+            Self::Eclipse => 1536
         }
     }
 
@@ -131,6 +135,7 @@ impl FromStr for Architecture
             "aurora" => Ok(Self::Aurora),
             "flare" => Ok(Self::Flare),
             "corona" => Ok(Self::Corona),
+            "eclipse" => Ok(Self::Eclipse),
             _ => anyhow::bail!("Unknown architecture '{value}'"),
         }
     }
