@@ -6,18 +6,17 @@ name = "exp_name"
 arch = "Aurora"
 
 [random]
+# Seeds weight initialisation and the order of training data
 seed = 42
 
 [hardware]
 gpu = 0
 
-[tensorboard]
-enabled = true
-path = "runs"
-
 [training]
 superbatches = 400
 log_every = 10
+# Directory that receives <name>/metrics.jsonl for bruce-plot; "runs" when omitted
+# metrics = "runs"
 
 [training.checkpoint]
 location = "checkpoints"
@@ -39,25 +38,40 @@ mapper = 4
 
 [training.data.batch]
 size = 16384
+# Batches per superbatch; 6104 when omitted
+# per_superbatch = 6104
 
 [training.data.source.0]
-format = "monty"
 path = "data/monty_value_00_06.bin"
 
-# [training.data.source.1]
-# format = "viri"
-# path = "data/viri_data_002_001.vf"
-
-# Text sources require separator, for example, separator = " | "
+# Optional per-source key:
+# scale = 1.0   multiplies this source's scores after decoding
 
 [training.data.filter]
 minimum_ply = 14
+# Plies since the first recorded position of each game
+# minimum_game_ply = 0
 # maximum_ply = 90
 # minimum_pieces = 0
 # minimum_eval = 100
 maximum_eval = 8000
 exclude_tactical = true
 exclude_check = true
+
+# Results of positions that precede a blunder. Omit the table to use every result as it is.
+# type: keep | drop_before | relabel
+# [training.data.labels]
+# type = "keep"
+
+# A blunder is a move that costs its mover at least this much win probability
+# [training.data.labels.blunder]
+# swing = 0.30
+
+# Keep or weigh positions by how likely their result is under the score (Stockfish's wld filter)
+# [training.data.labels.agreement]
+# action = "skip"
+# offset = 527
+# spread = 287
 
 [training.optimizer]
 minimum_weight = -1.98

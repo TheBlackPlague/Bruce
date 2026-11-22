@@ -16,12 +16,27 @@ jobs:
   format:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
           toolchain: nightly-2026-10-01
           components: rustfmt
-      - run: cargo +nightly-2026-10-01 fmt --all -- --check
+      - name: Check formatting
+        shell: bash
+        run: |
+          if ! cargo +nightly-2026-10-01 fmt --all -- --check; then
+            message='Formatting differs. Run: cargo +nightly-2026-10-01 fmt --all'
+            echo "::error::$message"
+            echo "$message" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Check comments
+        shell: bash
+        run: |
+          if grep -rnE '^\s*(//|/\*)' --include='*.rs' src | grep -v '// SAFETY:'; then
+            echo "::error::Only // SAFETY: comments are allowed"
+            exit 1
+          fi
 
   check:
     strategy:
@@ -30,15 +45,31 @@ jobs:
         os: [ubuntu-24.04, windows-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
           toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
-      - run: cargo test --locked --no-default-features --all-targets
       - run: cargo run --locked --no-default-features -- --help
+
+  plot:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: "0.13.0"
+      - run: uv sync --project plot --locked
+      - run: uv run --project plot --locked ruff check --no-cache plot
+      - run: uv run --project plot --locked ruff format --check --no-cache plot
 
   build:
     name: Build ${{ matrix.backend }}
@@ -57,11 +88,12 @@ jobs:
             platform: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
           toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@v2
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: ${{ matrix.backend }}
       - name: Install CUDA libraries
@@ -83,6 +115,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends hip-dev hipblas-dev rocblas-dev
           echo 'HIP_PATH=/opt/rocm-6.4.3' >> "$GITHUB_ENV"
           echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,/opt/rocm-6.4.3/lib' >> "$GITHUB_ENV"
+      - name: Lint
+        run: cargo clippy --locked --no-default-features --features ${{ matrix.backend }} --all-targets -- -D warnings
       - name: Build executable
         run: cargo build --locked --release --no-default-features --features ${{ matrix.backend }} --bin bruce
       - name: Name executable
@@ -96,7 +130,7 @@ jobs:
           mkdir dist
           cp target/release/bruce "dist/$name"
           echo "BINARY_NAME=$name" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ env.BINARY_NAME }}
           path: dist/*
@@ -109,7 +143,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: Bruce-*
           path: release

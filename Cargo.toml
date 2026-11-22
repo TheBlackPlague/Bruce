@@ -13,25 +13,37 @@ rocm = ["bullet_lib/rocm", "bullet-trainer/rocm", "bullet-gpu/rocm"]
 metal = ["bullet_lib/metal", "bullet-trainer/metal", "bullet-gpu/metal"]
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 anyhow = "1"
 bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
 bullet-trainer = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
 bullet-gpu = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6", default-features = false }
 bullet-compiler = { git = "https://github.com/jw1912/bullet", rev = "1896c0884c7ededb1868068bbf5583d1726b37f6" }
 clap = { version = "4.5", features = ["derive"] }
-console = "0.16"
-crc32c = "0.6"
-ctrlc = "3.4"
-indicatif = "0.18"
-crossterm = "0.29"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "scrolling-regions"] }
-prost = "0.14"
-rand = "0.9"
-serde = { version = "1", features = ["derive", "rc"] }
+crossterm = { version = "0.29", default-features = false, features = ["windows"] }
+libc = "0.2"
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 tempfile = "3"
+time = "0.3"
 toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
 
 [profile.release]
 lto = "thin"
@@ -39,10 +51,3 @@ codegen-units = 1
 
 [patch.crates-io]
 bulletformat = { git = "https://github.com/jw1912/bulletformat", rev = "eddd9a2d77dbc1391d68f23ba524657e91bd9a73" }
-
-# The upstream codec relies on wrapping negation for the minimum i16 score
-[profile.dev.package.sfbinpack]
-overflow-checks = false
-
-[profile.test.package.sfbinpack]
-overflow-checks = false

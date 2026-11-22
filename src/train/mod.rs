@@ -1,433 +1,352 @@
-pub mod architecture;
+pub mod bench;
 pub mod checkpoint;
-pub mod metrics;
+pub mod resume;
 
-use std::{
-    cell::RefCell,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+use std::{cell::RefCell, fs, path::PathBuf, sync::Arc, time::Instant};
+
+use anyhow::{Result, anyhow, bail};
+use bullet_gpu::runtime::{Device, Gpu};
+use bullet_lib::nn::ExecutionContext;
+use bullet_trainer::{
+    model::ModelWeights,
+    optimiser::{Optimiser, adam::AdamW},
+    reader::ReadMapLoader,
+    run::{
+        DataLoader, DataLoadingError, HostPool, PreparedBatchHost, Step, TrainingError, TrainingEvent,
+        TrainingSchedule, TrainingSteps, train_with_observer,
     },
 };
 
-use anyhow::{Context, Result, bail, ensure};
-use bullet_gpu::runtime::Device;
-use bullet_lib::{nn::ExecutionContext, trainer::schedule::lr::LrScheduler};
-use bullet_trainer::{
-    model::{ModelWeights, SavedFormat},
-    optimiser::{Optimiser, adam::AdamW},
-    reader::ReadMapLoader,
-    run::{DataLoadingError, TrainingError, TrainingEvent, TrainingSchedule, TrainingSteps, train_with_observer},
-};
-
-use self::{architecture::Architecture, checkpoint::Checkpoints, metrics::TrainingMetrics};
+use self::checkpoint::DataRecord;
 use crate::{
-    cli::{Cancelled, DisplayMode, Outcome, OutputOptions, Progress, Reporter},
-    config::{Config, schedule::BATCHES_PER_SUPERBATCH},
-    data::{self, DatasetReader, Format},
-    logging::Logger,
+    config::{Config, Data},
+    control::{Control, Outcome, Stop},
+    data::{
+        self, DataError, SourceIdentity,
+        pipeline::accepts_any,
+        select::Selection,
+        stream::{LoaderStats, TrainingStream},
+    },
+    events::{Batch, Checkpoint, Ending, Event, Level, Resumed, RunInfo, Stage, Superbatch},
+    schedule::Curve,
+    telemetry::Hub,
 };
 
 pub type Trainer = Optimiser<ExecutionContext, AdamW<ExecutionContext>>;
 
-pub fn check(config: &Config) -> Result<()>
+const BACKEND: &str = if cfg!(feature = "cuda") {
+    "cuda"
+} else if cfg!(feature = "rocm") {
+    "rocm"
+} else if cfg!(feature = "metal") {
+    "metal"
+} else {
+    "mock"
+};
+
+const NON_FINITE: &str =
+    "Loss is not finite; stopping without saving invalid weights. Check the data and learning rate.";
+const SAVE_FAILED: &str = "Checkpoint saving failed; stopping without it. Check disk space and permissions.";
+const UNSAVED: &str = "No checkpoint was saved; the next training invocation will start from the beginning.";
+
+pub fn run(config: Config, resume: Option<PathBuf>, control: &Control, hub: &Hub) -> Result<Ending>
 {
-    config.validate()?;
-    data::validate(&config.data)
-}
+    let halted = || control.halted().then(|| Ending::of(control.outcome()));
 
-pub fn check_reported(config: &Config, reporter: &Reporter, stop: Arc<AtomicBool>) -> Result<Outcome>
-{
-    reporter.set_stop_flag(stop.clone());
+    let architecture = config.run.arch;
 
-    config.validate()?;
-
-    let mut positions = 0u64;
-    for source in &config.data.sources {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(Outcome::Cancelled);
-        }
-
-        reporter.context("Dataset", source.path.to_string_lossy());
-        reporter.phase("Validating dataset");
-
-        let mut accepted = 0u64;
-        data::visit_boards_stoppable(source, config.data.filter.as_ref(), &stop, |board| {
-            if source.format != Format::Sf || data::valid_sf_score(board.score) {
-                positions += 1;
-                accepted += 1;
-
-                if positions.is_multiple_of(4096) {
-                    reporter.progress(Progress::Work { completed: positions, total: None, unit: "positions checked" });
-                }
-            }
-
-            Ok(false)
-        })?;
-
-        reporter.progress(Progress::Work { completed: positions, total: None, unit: "positions checked" });
-
-        if stop.load(Ordering::Relaxed) {
-            return Ok(Outcome::Cancelled);
-        }
-
-        ensure!(accepted > 0, "No positions pass the filter; check the dataset and filter settings");
+    if let Some(ending) = halted() {
+        return Ok(ending);
     }
 
-    Ok(Outcome::Success)
-}
-
-pub fn run(config: Config, resume: Option<PathBuf>, plain: bool) -> Result<()>
-{
-    let reporter = Reporter::new(OutputOptions {
-        display: if plain { DisplayMode::Plain } else { DisplayMode::Auto },
-        ..OutputOptions::default()
-    });
-
-    let stop = Arc::new(AtomicBool::new(false));
-
-    reporter.start("Train", &config.name);
-    reporter.set_stop_flag(stop.clone());
-
-    let result = (|| {
-        config.validate()?;
-
-        let path = PathBuf::from("logs").join(format!("{}.log", config.name));
-        let tensorboard =
-            config.tensorboard.enabled.then_some((config.tensorboard.path.as_path(), config.name.as_str()));
-
-        reporter.attach_log(Logger::open(&path, tensorboard)?);
-        reporter.context("Log", path.to_string_lossy());
-
-        if cfg!(any(feature = "cuda", feature = "rocm", feature = "metal")) {
-            let signal = stop.clone();
-            ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-                .context("Could not handle stop requests")?;
-        }
-
-        run_reported(config, resume, &reporter, stop)
-    })();
-    match result {
-        Ok(outcome) => {
-            reporter.finish(outcome)?;
-            if outcome == Outcome::Cancelled {
-                bail!("Training cancelled; resume from the latest saved checkpoint");
-            }
-
-            Ok(())
-        },
-        Err(error) => {
-            if error.is::<Cancelled>() {
-                reporter.finish(Outcome::Cancelled)?;
-            } else {
-                reporter.error(
-                    &error.to_string(),
-                    "Review the log before retrying or resuming.",
-                    &format!("{error:#}"),
-                );
-                reporter.finish(Outcome::Failed).context("Could not finalize reporting after training failed")?;
-            }
-
-            Err(error)
-        },
-    }
-}
-
-pub fn run_reported(
-    config: Config,
-    resume: Option<PathBuf>,
-    reporter: &Reporter,
-    stop: Arc<AtomicBool>,
-) -> Result<Outcome>
-{
-    reporter.set_stop_flag(stop.clone());
-
-    config.validate()?;
+    located(&config.training.data)?;
 
     if !cfg!(any(feature = "cuda", feature = "rocm", feature = "metal")) {
         bail!("Training needs a GPU build; enable cuda, rocm, or metal");
     }
 
-    if stop.load(Ordering::Relaxed) {
-        return Ok(Outcome::Cancelled);
+    hub.message(Level::Detail, "Checking dataset identity for checkpoints");
+    let identities = data::identities(&config.training.data.sources)?;
+
+    hub.message(Level::Detail, "Checking checkpoint destinations");
+    let resuming = resume.as_deref().map(|path| resume::inspect(path, &config, &identities, hub)).transpose()?;
+    let (resumed, saved) = resuming.unzip();
+    let completed = resumed.as_ref().map_or(0, |resumed| resumed.completed);
+    checkpoint::check_destinations(&config, completed + 1)?;
+
+    if let Some(ending) = halted() {
+        return Ok(ending);
     }
 
-    reporter.context("Device", format!("GPU {}", config.device));
-    reporter.context("Checkpoints", config.training.checkpoint.location.to_string_lossy());
-    reporter.verbose(&format!("Configuration: {}", config.checkpoint_value()));
-    reporter.phase("Checking training data");
-
-    let architecture: Architecture = config.architecture.parse()?;
-
-    let reader = DatasetReader::new(&config.data, config.seed, stop.clone())?;
-
-    if stop.load(Ordering::Relaxed) {
-        return Ok(Outcome::Cancelled);
-    }
-
-    reporter.phase("Checking dataset identity for checkpoints");
-    let checkpoints = Checkpoints::new(&config)?;
-
-    reporter.phase("Checking checkpoint destinations");
-    let completed = resume.as_ref().map(|path| checkpoints.inspect(path)).transpose()?.unwrap_or(0);
-    for superbatch in completed + 1..=config.training.superbatches {
-        if config.training.checkpoint.policy.due(superbatch, config.training.superbatches, false) {
-            checkpoints.check_destination(superbatch)?;
-        }
-    }
-
-    if stop.load(Ordering::Relaxed) {
-        return Ok(Outcome::Cancelled);
-    }
-
-    reporter.phase("Preparing network and GPU");
-
+    hub.message(Level::Detail, "Preparing network and GPU");
+    let device = Device::<ExecutionContext>::new(config.hardware.gpu)
+        .map_err(|error| anyhow!("Could not open GPU {}: {error:?}", config.hardware.gpu))?;
     let definition = architecture.definition();
-    let weights = ModelWeights::new(&definition, config.seed);
-
-    let device = Device::<ExecutionContext>::new(config.device)
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .context("Could not open the GPU; check the device number and GPU driver")?;
-
-    let mut trainer = Trainer::new(definition, weights, device, config.optimizer.params())
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
-        .context("Could not prepare training; check GPU memory and the network configuration")?;
-
-    if stop.load(Ordering::Relaxed) {
-        return Ok(Outcome::Cancelled);
-    }
+    let weights = ModelWeights::new(&definition, config.random.seed);
+    let mut trainer = Trainer::new(definition, weights, device, config.training.optimizer.params())
+        .map_err(|error| anyhow!("Could not prepare the network on the GPU: {error:?}"))?;
 
     if let Some(path) = &resume {
-        reporter.phase("Restoring checkpoint");
+        hub.message(Level::Detail, format!("Restoring checkpoint {}", path.display()));
         checkpoint::restore(&mut trainer, path)?;
-        reporter.context("Resumed checkpoint", path.to_string_lossy());
-
-        let exact =
-            config.data.filter.is_none() && config.data.sources.iter().all(|source| source.format == Format::Bullet);
-        reporter.notice(if exact {
-            "Resuming weights, schedule and dataset position"
-        } else {
-            "Resuming weights and schedule; data order may change"
-        });
     }
 
-    if stop.load(Ordering::Relaxed) {
-        return Ok(Outcome::Cancelled);
+    if let Some(ending) = halted() {
+        return Ok(ending);
     }
 
-    let steps = TrainingSteps {
-        batch_size: config.data.batch_size,
-        batches_per_superbatch: BATCHES_PER_SUPERBATCH,
-        start_superbatch: completed + 1,
-        end_superbatch: config.training.superbatches,
-    };
+    let data = &config.training.data;
+    hub.message(Level::Detail, "Checking training data");
+    probe(data, control)?;
+    let stream = TrainingStream::new(data, config.random.seed, saved.flatten(), Some(&identities))?;
+    if let Some(resumed) = &resumed {
+        resume::announce(resumed, hub);
+    }
 
-    let mut metrics = TrainingMetrics::new(steps, config.training.log_every);
+    if let Some(ending) = halted() {
+        return Ok(ending);
+    }
 
+    let mapper = architecture.mapper(blend(&config));
     let loader =
-        ReadMapLoader::new(reader.clone(), architecture.mapper(config.wdl.clone()), config.data.mapping_threads);
+        Timed { inner: ReadMapLoader::new(stream.clone(), mapper, data.threads.mapper), stats: stream.stats() };
 
+    let lr = config.training.lr.curve();
     let schedule = TrainingSchedule {
-        steps,
-        lr_schedule: config.learning_rate.clone().boxed(),
+        steps: TrainingSteps {
+            batch_size: data.batch.size,
+            batches_per_superbatch: data.batch.per_superbatch,
+            start_superbatch: completed + 1,
+            end_superbatch: config.training.superbatches,
+        },
+        lr_schedule: Box::new(move |step| lr(step.batch(), step.superbatch())),
         log_rate: config.training.log_every,
     };
 
-    let format = architecture.saved_format();
-    let state =
-        RefCell::new(TrainingState { latest_checkpoint: resume, checkpoint_error: None, nonfinite_loss: false });
+    let run = RefCell::new(Run {
+        config: &config,
+        control,
+        hub,
+        identities: &identities,
+        stream: &stream,
+        wdl: config.training.wdl.curve(),
+        resumed,
+        rates: (0.0, 0.0),
+        completed: 0,
+        saved: false,
+        ended: None,
+    });
 
-    reporter.phase("Compiling training and loading first batch");
+    hub.message(Level::Detail, "Compiling training and loading first batch");
 
     let result = train_with_observer(
         &mut trainer,
         schedule,
         loader,
-        |_, _, loss| state.borrow_mut().observe_loss(loss, reporter, &stop),
-        |trainer, step| {
-            let mut state = state.borrow_mut();
-            if config.training.checkpoint.policy.due(
-                step.superbatch(),
-                config.training.superbatches,
-                stop.load(Ordering::Relaxed),
-            ) {
-                state.save(trainer, step.superbatch(), &checkpoints, &format, reporter, &stop);
-            }
-        },
-        &mut |event| report_training_event(event, &mut metrics, reporter),
+        |_, step, loss| run.borrow_mut().batch(step, loss),
+        |trainer, step| run.borrow_mut().superbatch(trainer, step),
+        &mut |event| run.borrow_mut().observe(event),
     );
+    stream.finish();
+    hub.emit(Event::Stage(Stage::Finalizing));
 
-    if let Some(sample) = metrics.finish() {
-        reporter.sample(sample);
-    }
-
-    if let Some(progress) = metrics.progress() {
-        reporter.progress(Progress::Training(progress));
-    }
-
-    if let Some(loss) = metrics.run_loss() {
-        reporter.set_training_loss(loss);
-    }
-
-    let state = state.into_inner();
-    if let Some(path) = &state.latest_checkpoint {
-        reporter.context("Latest checkpoint", path.to_string_lossy());
-    }
-
-    let outcome = resolve_outcome(
-        result,
-        state.checkpoint_error,
-        reader.error(),
-        state.nonfinite_loss,
-        stop.load(Ordering::Relaxed),
-    )?;
-
-    if outcome == Outcome::Cancelled && state.latest_checkpoint.is_none() {
-        reporter.warning("No checkpoint was saved; the next training invocation will start from the beginning.");
-    }
-
-    Ok(outcome)
+    run.into_inner().resolve(result)
 }
 
-struct TrainingState
+fn blend(config: &Config) -> impl Fn(Step) -> f32 + Send + Sync + 'static
 {
-    latest_checkpoint: Option<PathBuf>,
-    checkpoint_error: Option<anyhow::Error>,
-    nonfinite_loss: bool,
+    let wdl = config.training.wdl.curve();
+    let table = config.training.wdl.table(config.training.superbatches);
+
+    move |step| {
+        let superbatch = step.superbatch();
+        table
+            .as_deref()
+            .and_then(|table| table.get(superbatch).copied())
+            .unwrap_or_else(|| wdl(step.batch(), superbatch))
+    }
 }
 
-impl TrainingState
+fn located(data: &Data) -> Result<(), DataError>
 {
-    fn observe_loss(&mut self, loss: f32, reporter: &Reporter, stop: &AtomicBool)
+    data.sources.iter().try_for_each(|source| match fs::metadata(&source.path) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(DataError::io(&error).at(source)),
+    })
+}
+
+fn probe(data: &Data, control: &Control) -> Result<(), DataError>
+{
+    let selection = Selection { filter: data.filter.clone(), labels: data.labels, ..Selection::default() };
+    for source in &data.sources {
+        let selection = selection.clone().identified(source)?;
+        if !accepts_any(source, &selection, control)? && control.stop() == Stop::Running {
+            return Err(DataError::no_positions().at(source));
+        }
+    }
+
+    Ok(())
+}
+
+struct Run<'a>
+{
+    config: &'a Config,
+    control: &'a Control,
+    hub: &'a Hub,
+    identities: &'a [SourceIdentity],
+    stream: &'a TrainingStream,
+    wdl: Curve,
+    resumed: Option<Resumed>,
+    rates: (f32, f32),
+    completed: usize,
+    saved: bool,
+    ended: Option<Result<Outcome>>,
+}
+
+impl Run<'_>
+{
+    fn observe(&mut self, event: &TrainingEvent)
     {
+        let None = self.ended else { return };
+
+        match event {
+            TrainingEvent::RunStarted { steps, device_name, device_arch, .. } => {
+                let config = self.config;
+                let info = RunInfo {
+                    name: config.run.name.clone(),
+                    architecture: config.run.arch.name(),
+                    device: device_name.clone(),
+                    device_architecture: device_arch.clone(),
+                    backend: BACKEND,
+                    steps: *steps,
+                    schedule: config.schedule_points(),
+                    phases: config.phases(),
+                    labels: config.training.data.labels.to_string(),
+                    configuration: config.checkpoint_value(),
+                    resumed: self.resumed.clone(),
+                };
+                self.hub.emit(Event::Started(Box::new(info)));
+            },
+            TrainingEvent::TrainingReady { setup_time, .. } => {
+                self.hub.emit(Event::Loader(self.stream.stats().snapshot()));
+                self.hub.emit(Event::Ready(*setup_time));
+                self.hub.emit(Event::Stage(Stage::Training));
+            },
+            TrainingEvent::BatchCompleted { step, learning_rate, .. } => {
+                self.rates = (*learning_rate, (self.wdl)(step.batch(), step.superbatch()));
+            },
+            TrainingEvent::SuperbatchCompleted { step, loss, superbatch_elapsed, .. } => {
+                let ((learning_rate, wdl), superbatch, duration) = (self.rates, step.superbatch(), *superbatch_elapsed);
+                self.hub.emit(Event::Superbatch(Superbatch { superbatch, loss: *loss, duration, learning_rate, wdl }));
+            },
+            _ => {},
+        }
+    }
+
+    fn batch(&mut self, step: Step, loss: f32)
+    {
+        let None = self.ended else { return };
+
+        let (superbatch, batch) = (step.superbatch(), step.batch() + 1);
         if !loss.is_finite() {
-            if !self.nonfinite_loss {
-                reporter.warning(
-                    "Loss is not finite; stopping without saving invalid weights. Check the data and learning rate.",
-                );
-            }
-
-            self.nonfinite_loss = true;
-            stop.store(true, Ordering::Relaxed);
-        }
-    }
-
-    fn save(
-        &mut self,
-        trainer: &Trainer,
-        superbatch: usize,
-        checkpoints: &Checkpoints,
-        format: &[SavedFormat],
-        reporter: &Reporter,
-        stop: &AtomicBool,
-    )
-    {
-        if self.nonfinite_loss || self.checkpoint_error.is_some() {
-            return;
-        }
-
-        reporter.phase("Saving checkpoint");
-        match checkpoints.save(trainer, format, superbatch) {
-            Ok(path) => {
-                reporter.context("Latest checkpoint", path.to_string_lossy());
-                self.latest_checkpoint = Some(path);
-            },
-            Err(error) => {
-                reporter.warning(
-                    "Checkpoint saving failed; stopping at a safe boundary. Check disk space and permissions.",
-                );
-                self.checkpoint_error = Some(error.context(format!(
-                    "Could not save checkpoint for superbatch {superbatch}; check disk space and destination \
-                     permissions"
-                )));
-                stop.store(true, Ordering::Relaxed);
-            },
-        }
-
-        if stop.load(Ordering::Relaxed) {
-            reporter.stopping();
+            self.hub.message(Level::Warning, NON_FINITE);
+            self.end(Err(anyhow!("The loss is not finite at superbatch {superbatch}, batch {batch}")));
+        } else if self.control.outcome() == Outcome::Aborted {
+            self.end(Ok(Outcome::Aborted));
         } else {
-            reporter.phase("Training");
+            let (learning_rate, wdl) = self.rates;
+            self.hub.emit(Event::Batch(Batch { superbatch, batch, loss, learning_rate, wdl }));
+            self.hub.emit(Event::Loader(self.stream.stats().snapshot()));
         }
     }
+
+    fn superbatch(&mut self, trainer: &Trainer, step: Step)
+    {
+        let None = self.ended else { return };
+
+        let superbatch = step.superbatch();
+        self.completed = superbatch;
+
+        let committed = self.control.commit();
+        if committed {
+            self.ended = Some(Ok(Outcome::Stopped));
+            self.hub.emit(Event::StopCommitted(superbatch));
+        } else if self.control.outcome() == Outcome::Aborted {
+            return self.end(Ok(Outcome::Aborted));
+        }
+
+        let reason = self.config.training.checkpoint.reason(superbatch, self.config.training.superbatches, committed);
+        if let Some(reason) = reason {
+            self.hub.emit(Event::Stage(Stage::SavingCheckpoint));
+            let started = Instant::now();
+            let data = self.stream.bookmark(superbatch).map(|bookmark| DataRecord { bookmark });
+            let path = match checkpoint::save(self.config, self.identities, trainer, superbatch, data) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.hub.message(Level::Warning, SAVE_FAILED);
+                    let error = error.context(format!("Could not save the checkpoint of superbatch {superbatch}"));
+                    return self.end(Err(error));
+                },
+            };
+            self.hub.emit(Event::Checkpoint(Checkpoint { superbatch, path, reason, duration: started.elapsed() }));
+            self.saved = true;
+        }
+
+        if committed {
+            self.stream.finish();
+        } else if reason.is_some() {
+            self.hub.emit(Event::Stage(Stage::Training));
+        }
+    }
+
+    fn resolve(self, result: Result<(), TrainingError<ExecutionContext>>) -> Result<Ending>
+    {
+        let last = self.config.training.superbatches;
+        let outcome = match (result, self.stream.failure(), self.ended) {
+            (Ok(()), _, None) => Outcome::Finished,
+            (Ok(()), _, Some(Ok(Outcome::Stopped))) if self.completed == last => Outcome::Finished,
+            (Ok(()), _, Some(ended)) => ended?,
+            (Err(TrainingError::DataLoadingError(_)), None, Some(ended)) if self.stream.asked() => ended?,
+            (Err(TrainingError::DataLoadingError(_)), Some(error), _) => return Err(error.into()),
+            (Err(error), ..) => bail!("Training failed inside Bullet: {error:?}"),
+        };
+
+        if outcome != Outcome::Finished && !self.saved && self.resumed.is_none() {
+            self.hub.message(Level::Warning, UNSAVED);
+        }
+
+        Ok(Ending::of(outcome))
+    }
+
+    fn end(&mut self, ended: Result<Outcome>)
+    {
+        self.ended = Some(ended);
+        self.stream.finish();
+    }
 }
 
-fn report_training_event(event: &TrainingEvent, metrics: &mut TrainingMetrics, reporter: &Reporter)
+struct Timed<L>
 {
-    match event {
-        TrainingEvent::RunStarted { device_name, .. } => reporter.context("Device", device_name),
-        TrainingEvent::TrainingReady { .. } => reporter.phase("Training"),
-        TrainingEvent::SuperbatchCompleted { step, loss, .. } => {
-            reporter.verbose(&format!("Superbatch {} complete: mean loss {loss:.6}", step.superbatch()))
-        },
-        TrainingEvent::RunCompleted { .. } => reporter.phase("Finalizing training"),
-        _ => {},
-    }
-
-    let update = metrics.observe(event);
-
-    if let Some(progress) = update.progress {
-        reporter.progress(Progress::Training(progress));
-    }
-
-    if let Some(sample) = update.sample {
-        reporter.sample(sample);
-    }
+    inner: L,
+    stats: Arc<LoaderStats>,
 }
 
-fn resolve_outcome(
-    result: Result<(), TrainingError<ExecutionContext>>,
-    checkpoint_error: Option<anyhow::Error>,
-    dataset_error: Option<String>,
-    nonfinite_loss: bool,
-    stopping: bool,
-) -> Result<Outcome>
+impl<L: DataLoader> DataLoader for Timed<L>
 {
-    if let Some(error) = checkpoint_error {
-        return Err(error);
+    fn map_batches<G: Gpu, F: FnMut(PreparedBatchHost<G>) -> bool>(
+        self,
+        pool: &Arc<HostPool<G>>,
+        start: Step,
+        batch_size: usize,
+        mut f: F,
+    ) -> Result<(), DataLoadingError>
+    {
+        let stats = self.stats;
+        self.inner.map_batches(pool, start, batch_size, |batch| {
+            let handed = Instant::now();
+            let finished = f(batch);
+            LoaderStats::add(&stats.handoff, handed.elapsed());
+            finished
+        })
     }
-
-    if let Some(error) = dataset_error {
-        return Err(anyhow::anyhow!(error).context("Could not read the dataset; validate it with train --check"));
-    }
-
-    if nonfinite_loss {
-        bail!("Training stopped because the loss is not finite; check the data and learning rate before resuming");
-    }
-
-    match result {
-        Ok(()) if stopping => Ok(Outcome::Cancelled),
-        Ok(()) => Ok(Outcome::Success),
-        Err(error) if stopping && ended_early(&error) => Ok(Outcome::Cancelled),
-        Err(error) => Err(training_error(error)),
-    }
-}
-
-fn ended_early(error: &TrainingError<ExecutionContext>) -> bool
-{
-    match error {
-        TrainingError::DataLoadingError(DataLoadingError::NoBatchesReceived) => true,
-        TrainingError::DataLoadingError(DataLoadingError::Message(message)) => {
-            message == "Data loader ended before all scheduled batches completed"
-        },
-        _ => false,
-    }
-}
-
-fn training_error(error: TrainingError<ExecutionContext>) -> anyhow::Error
-{
-    let summary = match &error {
-        TrainingError::DataLoadingError(_) => "Could not load training data; validate it with train --check",
-        TrainingError::GradientCalculationError(_) | TrainingError::OptimiserUpdateError(_) => {
-            "The GPU could not complete a training step; check available GPU memory and driver diagnostics"
-        },
-        TrainingError::CompilingBackwards(_) => {
-            "Could not prepare the network for training; check the GPU backend and network configuration"
-        },
-        TrainingError::InvalidSchedule => "The training schedule is invalid; check the training configuration",
-        TrainingError::IoError => "Could not read or write training files; check paths, permissions and free space",
-        TrainingError::Unexpected(_) => "The GPU could not complete the operation; check GPU driver diagnostics",
-    };
-    anyhow::anyhow!("{error:?}").context(summary)
 }
