@@ -1,0 +1,22 @@
+[project]
+name = "bruce-plot"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["matplotlib>=3.11,<3.12", "numpy"]
+
+[project.scripts]
+bruce-plot = "bruce_plot.__main__:main"
+
+[dependency-groups]
+dev = ["ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
