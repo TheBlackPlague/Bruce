@@ -113,7 +113,7 @@ pub fn loader(config: &Config, duration: Duration, control: &Control, hub: &Hub)
             let total = (reading + mapping + blocked).as_secs_f64();
             let shares = [("reading", reading), ("mapping", mapping), ("blocked", blocked)]
                 .map(|(name, time)| format!("{name} {:.1}%", 100.0 * time.as_secs_f64() / total));
-            (total > 0.0).then(|| ("Bruce loader thread".to_owned(), shares.join(" · ")))
+            (total > 0.0).then(|| ("Loader thread".to_owned(), shares.join(" · "), String::new()))
         })
         .into_iter()
         .collect();

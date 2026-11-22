@@ -23,7 +23,7 @@ use crate::{
     control::{self, Control, Outcome, Stop},
     data::{Source, pipeline::Sampling},
     events::{Ending, Level, Task},
-    render::{self, WIDTH},
+    render::{self, HEADER, WIDTH},
     screen::Screen,
     telemetry::{Hub, Live, Setup},
     text,
@@ -62,7 +62,7 @@ pub fn main() -> ExitCode
 
     let (config, subject, facts, work) = match prepare(command) {
         Ok(prepared) => prepared,
-        Err(error) => return failed(&mut out, task, format!("{error:#}"), Some(advice(task)), colored),
+        Err(error) => return failed(&mut out, task, lines(&error), Some(advice(task)), colored),
     };
     let run = config
         .as_ref()
@@ -135,7 +135,7 @@ pub fn main() -> ExitCode
         Ok(Ok(ending)) => Ok(ending),
         Ok(Err(error)) => {
             hub.message(Level::Error, format!("{error:#}"));
-            Err((format!("{error:#}"), advice(task), String::new()))
+            Err((lines(&error), advice(task), String::new()))
         },
         Err(payload) => Err(unexpected(&hub, control::panic_message(payload.as_ref()))),
     };
@@ -171,7 +171,7 @@ fn prepare(command: Command) -> Result<(Option<Config>, String, String, Work)>
             let network = options.network.as_ref();
             let subject = match (network, &options.config, &options.inputs[..]) {
                 (Some(network), ..) => text::file_name(&network.checkpoint),
-                (None, Some((path, _)), _) => fitted(path, "Analysis · ".chars().count()),
+                (None, Some((path, _)), _) => text::path(path, HEADER - "Analysis · ".chars().count()),
                 (None, None, [input]) => text::file_name(&input.path),
                 (None, None, inputs) => counted(inputs, "input"),
             };
@@ -208,7 +208,7 @@ fn prepare(command: Command) -> Result<(Option<Config>, String, String, Work)>
                 CheckMode::Full => "full scan",
             };
             let facts = format!(" · {scope} · {}", sized(sources, "source"));
-            let facts = format!("{}{facts}", fitted(&path, facts.chars().count()));
+            let facts = format!("{}{facts}", text::path(&path, HEADER.saturating_sub(facts.chars().count())));
             (name, facts, Box::new(move |control, hub| check::run(&owned, &path, mode, control, hub)))
         },
         (None, Some(seconds)) => {
@@ -226,7 +226,8 @@ fn prepare(command: Command) -> Result<(Option<Config>, String, String, Work)>
             (name, facts, Box::new(move |control, hub| bench::loader(&owned, duration, control, hub)))
         },
         (None, None) => {
-            (String::new(), String::new(), Box::new(move |control, hub| train::run(owned, resume, control, hub)))
+            let arch = config.run.arch.to_string();
+            (name, arch, Box::new(move |control, hub| train::run(owned, resume, control, hub)))
         },
     };
     Ok((Some(config), subject, facts, work))
@@ -327,7 +328,7 @@ fn failed(out: &mut AutoStream<Stderr>, task: Task, error: String, help: Option<
 fn forced(hub: &Hub, out: &mut AutoStream<Stderr>, code: i32) -> !
 {
     hub.message(Level::Warning, FORCED);
-    print(out, &[format!("Warning: {FORCED}")]);
+    print(out, &[render::warning(FORCED)]);
     process::exit(code)
 }
 
@@ -360,19 +361,15 @@ fn advice(task: Task) -> &'static str
     }
 }
 
-fn fitted(path: &Path, taken: usize) -> String
-{
-    let whole = path.display().to_string();
-    if whole.chars().count() + taken <= WIDTH { whole } else { clipped(text::file_name(path), taken) }
-}
-
 fn clipped(name: String, taken: usize) -> String
 {
-    match (name.chars().count() + taken).saturating_sub(WIDTH) {
+    match (name.chars().count() + taken).saturating_sub(HEADER) {
         0 => name,
         excess => format!("…{}", name.chars().skip(excess + 1).collect::<String>()),
     }
 }
+
+fn lines(error: &anyhow::Error) -> String { error.chain().map(ToString::to_string).collect::<Vec<_>>().join("\n") }
 
 fn threads(count: usize) -> String { if count == 1 { "1 thread".to_owned() } else { format!("{count} threads") } }
 

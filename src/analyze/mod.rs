@@ -25,7 +25,7 @@ use crate::{
         pipeline::{self, BLOCK, Block, Sampling, ScanOptions},
         select::Selection,
     },
-    events::{Ending, Event, Level, Progress, Rows, ScanInfo, Task},
+    events::{Ending, Event, Facts, Level, Progress, ScanInfo, Task},
     model::{Architecture, Evaluator, Losses, sigmoid},
     telemetry::Hub,
     text,
@@ -222,7 +222,7 @@ pub fn run(options: &Options, control: &Control, hub: &Hub) -> Result<Ending>
     };
 
     let mut rows = summary(&report, elapsed);
-    rows.push(("Elapsed".to_owned(), text::span(began.elapsed())));
+    rows.push(("Elapsed".to_owned(), text::span(began.elapsed()), String::new()));
     Ok(Ending { rows, files: vec![("Report".to_owned(), output.display().to_string())], ..Ending::of(outcome) })
 }
 
@@ -357,12 +357,12 @@ fn filed(created: &str, report: &[u8]) -> Result<PathBuf>
     Ok(path)
 }
 
-fn summary(report: &Report, elapsed: Duration) -> Rows
+fn summary(report: &Report, elapsed: Duration) -> Facts
 {
     let Combined { games, scores, calibration, filter, network } = &report.combined;
     let inputs = &report.inputs;
     let mut rows = Vec::new();
-    let mut row = |label: &str, value: String| rows.push((label.to_owned(), value));
+    let mut row = |label: &str, value: String| rows.push((label.to_owned(), value, String::new()));
 
     if !report.complete {
         let read = inputs.iter().map(|input| input.bytes_read).sum();

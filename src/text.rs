@@ -1,4 +1,8 @@
-use std::{path::Path, time::Duration};
+use std::{
+    env,
+    path::{self, Component, Path},
+    time::Duration,
+};
 
 pub fn count(value: u64) -> String
 {
@@ -10,6 +14,33 @@ pub fn count(value: u64) -> String
 pub fn file_name(path: &Path) -> String
 {
     path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+pub fn path(path: &Path, room: usize) -> String
+{
+    let near = env::current_dir().ok().zip(path::absolute(path).ok());
+    let near = near.and_then(|(here, whole)| whole.strip_prefix(here).ok().map(Path::to_path_buf));
+    let path = near.filter(|near| !near.as_os_str().is_empty()).unwrap_or_else(|| path.to_path_buf());
+
+    let (mut root, mut names) = (String::new(), Vec::new());
+    for part in path.components() {
+        match part {
+            Component::Prefix(prefix) => root.push_str(&prefix.as_os_str().to_string_lossy()),
+            Component::RootDir => root.push('/'),
+            part => names.push(part.as_os_str().to_string_lossy()),
+        }
+    }
+    let fits = |shown: &String| shown.chars().count() <= room;
+    let whole = format!("{root}{}", names.join("/"));
+    if fits(&whole) {
+        return whole;
+    }
+    let shortened = (1..names.len()).map(|start| format!("{root}…/{}", names[start..].join("/"))).find(fits);
+    shortened.unwrap_or_else(|| {
+        let name = names.last().map_or("", |name| name.as_ref());
+        let skip = name.chars().count().saturating_sub(room.saturating_sub(1));
+        format!("…{}", name.chars().skip(skip).collect::<String>())
+    })
 }
 
 pub fn bytes(value: u64) -> String
@@ -61,6 +92,14 @@ pub fn span(value: Duration) -> String
 pub fn finished(input: usize, games: u64, positions: u64, elapsed: Duration) -> String
 {
     format!("input {input} finished: {} games, {} positions in {}", count(games), count(positions), span(elapsed))
+}
+
+pub fn decimal(value: f32) -> String
+{
+    let magnitude = value.abs();
+    let shown = magnitude.is_finite() && magnitude > 0.0;
+    let decimals = if shown { ((-magnitude.log10()).ceil() as usize + 2).max(6) } else { 6 };
+    format!("{value:.decimals$}")
 }
 
 pub fn rate(positions_per_second: f64) -> String

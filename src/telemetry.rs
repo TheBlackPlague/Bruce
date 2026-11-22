@@ -180,7 +180,6 @@ pub struct Live
     pub superbatch: usize,
     pub batch: usize,
     pub learning_rate: f32,
-    pub wdl: f32,
     pub stalls: u32,
     pub stall_time: Duration,
     log_every: usize,
@@ -225,7 +224,6 @@ impl Live
             superbatch: 0,
             batch: 0,
             learning_rate: 0.0,
-            wdl: 0.0,
             stalls: 0,
             stall_time: Duration::ZERO,
             log_every,
@@ -260,8 +258,7 @@ impl Live
                 let TrainingSteps { batch_size, batches_per_superbatch, start_superbatch, end_superbatch } = run.steps;
                 let chip = run.device_architecture.as_deref().unwrap_or("unknown");
                 self.superbatch = start_superbatch;
-                (self.learning_rate, self.wdl) =
-                    run.schedule.get(self.superbatch.saturating_sub(1)).copied().unwrap_or_default();
+                self.learning_rate = run.schedule.get(self.superbatch.saturating_sub(1)).map_or(0.0, |&(lr, _)| lr);
                 self.run = Some((**run).clone());
                 self.loader.clear();
                 lines.log.push(info(format!(
@@ -402,7 +399,7 @@ impl Live
 
         let (sum, count) = self.loss;
         (self.superbatch, self.batch) = (sample.superbatch, sample.batch);
-        (self.learning_rate, self.wdl) = (sample.learning_rate, sample.wdl);
+        self.learning_rate = sample.learning_rate;
         self.trained += 1;
         self.loss = (sum + f64::from(sample.loss), count + 1);
         self.window_loss += f64::from(sample.loss);

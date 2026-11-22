@@ -5,6 +5,7 @@ use bullet_trainer::run::TrainingSteps;
 use crate::control::Outcome;
 
 pub type Rows = Vec<(String, String)>;
+pub type Facts = Vec<(String, String, String)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level
@@ -187,7 +188,7 @@ pub struct Ending
 {
     pub outcome: Outcome,
     pub grid: Rows,
-    pub rows: Rows,
+    pub rows: Facts,
     pub files: Rows,
 }
 

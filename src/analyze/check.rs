@@ -124,7 +124,7 @@ pub fn run(config: &Config, path: &Path, mode: CheckMode, control: &Control, hub
         (true, CheckMode::Quick) => "sampled positions",
         (true, CheckMode::Full) => "positions",
     };
-    let scanned = format!("{share} of {} {what}", text::scaled(positions as f64));
+    let scanned = (share, format!(" of {} {what}", text::scaled(positions as f64)));
 
     let training = (training.superbatches as u64)
         .saturating_mul(data.batch.per_superbatch as u64)
@@ -136,13 +136,15 @@ pub fn run(config: &Config, path: &Path, mode: CheckMode, control: &Control, hub
         .filter(|accepted| *accepted > 0.0)
         .map(|accepted| training / accepted);
     let passes = match (exact, estimate) {
-        (Some(passes), _) => format!("{passes:.1} over {} training positions", text::scaled(training)),
-        (None, Some(passes)) if complete => format!("about {passes:.1}, estimated from the sample"),
-        (None, _) => "needs a complete scan".to_owned(),
+        (Some(passes), _) => (format!("{passes:.1}"), format!(" over {} training positions", text::scaled(training))),
+        (None, Some(passes)) if complete => (format!("about {passes:.1}"), ", estimated from the sample".to_owned()),
+        (None, _) => ("needs a complete scan".to_owned(), String::new()),
     };
 
-    let rows = [("Accepted", scanned), ("Passes", passes), ("Elapsed", text::span(started.elapsed()))];
-    Ok(Ending { rows: rows.map(|(label, value)| (label.to_owned(), value)).into(), ..Ending::of(outcome) })
+    let elapsed = (text::span(started.elapsed()), String::new());
+    let rows = [("Accepted", scanned), ("Passes", passes), ("Elapsed", elapsed)];
+    let rows = rows.map(|(label, (value, qualifier))| (label.to_owned(), value, qualifier));
+    Ok(Ending { rows: rows.into(), ..Ending::of(outcome) })
 }
 
 fn share_of(seen: &[(Counters, u64, u64)]) -> (u64, u64)
