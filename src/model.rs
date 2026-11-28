@@ -10,7 +10,7 @@ use bullet_gpu::{
 use bullet_lib::{
     game::{
         formats::bulletformat::ChessBoard,
-        inputs::{Chess768, SparseInputType},
+        inputs::{Chess768, ChessBucketsMirrored, SparseInputType},
     },
     nn::ExecutionContext,
 };
@@ -36,6 +36,7 @@ pub enum Architecture
     Flare,
     Corona,
     Eclipse,
+    Parhelion,
 }
 
 fn inputs() -> ModelInputs<((SparseInput, SparseInput), DenseInput<f32>)>
@@ -58,6 +59,7 @@ impl Architecture
             Self::Flare => "Flare",
             Self::Corona => "Corona",
             Self::Eclipse => "Eclipse",
+            Self::Parhelion => "Parhelion",
         }
     }
 
@@ -67,7 +69,7 @@ impl Architecture
             Self::Starshard => 256,
             Self::Aurora => 384,
             Self::Flare | Self::Corona => 768,
-            Self::Eclipse => 1536,
+            Self::Eclipse | Self::Parhelion => 1536,
         }
     }
 
@@ -82,7 +84,7 @@ impl Architecture
 
             let (y0, y1) = match self {
                 Self::Starshard | Self::Aurora | Self::Flare => (y0.crelu(), y1.crelu()),
-                Self::Corona | Self::Eclipse => (y0.screlu(), y1.screlu()),
+                Self::Corona | Self::Eclipse | Self::Parhelion => (y0.screlu(), y1.screlu()),
             };
 
             let y = l1.forward(y0.concat(y1));
@@ -97,13 +99,19 @@ impl Architecture
     {
         ModelInputsMapper::build(&inputs(), move |position: &ChessBoard, step, ((stm, ntm), targets)| {
             let mut features = stm.iter_mut().zip(ntm.iter_mut());
-
-            Chess768.map_features(position, |ours, theirs| {
+            let write = |ours, theirs| {
                 if let Some((stm, ntm)) = features.next() {
                     *stm = ours as i32;
                     *ntm = theirs as i32;
                 }
-            });
+            };
+
+            match self {
+                Self::Starshard | Self::Aurora | Self::Flare | Self::Corona | Self::Eclipse => {
+                    Chess768.map_features(position, write)
+                },
+                Self::Parhelion => ChessBucketsMirrored::default().map_features(position, write),
+            }
 
             if let Some((stm, ntm)) = features.next() {
                 *stm = -1;
