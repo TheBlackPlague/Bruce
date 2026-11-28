@@ -28,9 +28,11 @@ use crate::control::{Control, Stop, contain, lock};
 pub const BLOCK: u64 = 4 << 20;
 
 const PROBE: ScanOptions = ScanOptions { sampling: Sampling::All, threads: 4, in_flight: None, block: BLOCK };
-const CREDITS: usize = 4;
+pub(super) const CREDITS: usize = 4;
 pub(super) const TICK: Duration = Duration::from_millis(20);
 const RECORD_LIMIT: u64 = 128 << 20;
+const AHEAD: u64 = 64 << 20;
+const REQUEST: usize = 1 << 20;
 
 type Stopping<'a> = &'a (dyn Fn() -> bool + Sync);
 type Decoded<T, E> = (u64, usize, Option<Result<(BlockMeta, T), E>>);
@@ -230,7 +232,7 @@ pub fn run<T: Send, E: From<DataError> + Send>(
 ) -> Result<bool, E>
 {
     let threads = options.threads;
-    let credits = options.in_flight.map_or(CREDITS * threads, |cap| cap.clamp(1, CREDITS * threads));
+    let credits = options.in_flight.map_or(CREDITS * threads, |cap| cap.max(1));
     let head = options.sampling.head();
     let inputs = sources.iter().map(|source| SourceFile::open(source, head)).collect::<Result<Vec<_>, _>>()?;
 
@@ -344,6 +346,8 @@ struct SourceFile
     position: u64,
     records: u64,
     carry: Vec<u8>,
+    ahead: Vec<u8>,
+    taken: usize,
 }
 
 impl SourceFile
@@ -353,7 +357,16 @@ impl SourceFile
         File::open(&source.path)
             .and_then(|file| {
                 let length = file.metadata()?.len();
-                Ok(Self { file, limit, length, position: 0, records: 0, carry: Vec::new() })
+                Ok(Self {
+                    file,
+                    limit,
+                    length,
+                    position: 0,
+                    records: 0,
+                    carry: Vec::new(),
+                    ahead: Vec::new(),
+                    taken: 0,
+                })
             })
             .map_err(|error| DataError::io(&error).at(source))
     }
@@ -409,17 +422,30 @@ impl SourceFile
 
     fn append(&mut self, to: u64) -> io::Result<()>
     {
-        let count = to - self.position;
-        let wanted = usize::try_from(count).map_err(io::Error::other)?;
+        let wanted = usize::try_from(to - self.position).map_err(io::Error::other)?;
+        if self.ahead.len() - self.taken < wanted {
+            self.ahead.drain(..self.taken);
+            self.taken = 0;
 
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(self.position))?;
-        self.carry.reserve_exact(wanted);
-        if file.take(count).read_to_end(&mut self.carry)? != wanted {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+            let (held, from) = (self.ahead.len(), self.position + self.ahead.len() as u64);
+            let end = (from / AHEAD + 1).saturating_mul(AHEAD).min(self.length).max(to);
+            self.ahead.resize(held + usize::try_from(end - from).map_err(io::Error::other)?, 0);
+
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(from))?;
+            for piece in self.ahead[held..].chunks_mut(REQUEST) {
+                file.read_exact(piece)?;
+            }
         }
 
+        self.carry.reserve_exact(wanted);
+        self.carry.extend_from_slice(&self.ahead[self.taken..self.taken + wanted]);
+        self.taken += wanted;
         self.position = to;
+        if to >= self.length {
+            (self.ahead, self.taken) = (Vec::new(), 0);
+        }
+
         Ok(())
     }
 }
@@ -476,8 +502,9 @@ impl Stages<'_>
             let cursor = plan.cursor();
             if epoch != Some(cursor.epoch) {
                 for (input, (&offset, &games)) in inputs.iter_mut().zip(cursor.offsets.iter().zip(&cursor.games)) {
-                    (input.position, input.records) = (offset, games);
+                    (input.position, input.records, input.taken) = (offset, games, 0);
                     input.carry.clear();
+                    input.ahead.clear();
                 }
                 epoch = Some(cursor.epoch);
             }
@@ -504,6 +531,7 @@ impl Stages<'_>
 
             plan.advance(source, plan.lengths[source].saturating_sub(offset), 0);
             self.pool.put(mem::take(&mut input.carry));
+            (input.ahead, input.taken) = (Vec::new(), 0);
         }
 
         Some(issued)

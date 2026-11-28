@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     DataError, SourceIdentity, is_unit,
-    pipeline::{self, BLOCK, Cursor, OnDrop, Plan, Pool, Sampling, ScanOptions, TICK},
+    pipeline::{self, BLOCK, CREDITS, Cursor, OnDrop, Plan, Pool, Sampling, ScanOptions, TICK},
     select::{Selection, pass_key},
 };
 use crate::{config::Data, control::lock, events::LoaderSample};
@@ -33,6 +33,7 @@ pub const READER_VERSION: u32 = 1;
 
 const SLICE_BATCHES: usize = 64;
 const SHUFFLE_STRIDE: usize = 1 << 16;
+const IN_FLIGHT: usize = 96;
 
 #[derive(Default)]
 pub struct LoaderStats
@@ -243,8 +244,9 @@ impl Shared
     {
         let data = &self.data;
         let stopped = || done.load(Ordering::Acquire) || self.finishing();
-        let options =
-            ScanOptions { sampling: Sampling::All, threads: data.threads.loader, in_flight: None, block: BLOCK };
+        let threads = data.threads.loader;
+        let in_flight = Some(IN_FLIGHT.max(CREDITS * threads));
+        let options = ScanOptions { sampling: Sampling::All, threads, in_flight, block: BLOCK };
         let buffers = Pool::default();
 
         let mut start = plan.cursor();
